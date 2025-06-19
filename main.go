@@ -1,8 +1,6 @@
 package main
 
 import (
-	"french-citizenship-api/internal/api"
-	"french-citizenship-api/internal/storage"
 	"log"
 	"net/http"
 	"os"
@@ -12,29 +10,29 @@ import (
 )
 
 func main() {
-	// Set up logging with timestamps
+	// Set up proper logging with timestamps and microseconds
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.Println("[STARTUP] French Citizenship API starting...")
+	logStartup("French Citizenship API starting...")
 
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8043" // Default port if not set
-		log.Printf("[CONFIG] Using default port: %s", port)
+		port = "8043"
+		logStartup("Using default port: %s", port)
 	} else {
-		log.Printf("[CONFIG] Using port from environment: %s", port)
+		logStartup("Using port from environment: %s", port)
 	}
 
 	dbPath := os.Getenv("DB_PATH")
 	if dbPath == "" {
 		dbPath = "./citizenship.db"
-		log.Printf("[CONFIG] Using default database path: %s", dbPath)
+		logStartup("Using default database path: %s", dbPath)
 	} else {
-		log.Printf("[CONFIG] Using database path from environment: %s", dbPath)
+		logStartup("Using database path from environment: %s", dbPath)
 	}
 
 	// Initialize database
-	log.Println("[STARTUP] Initializing database connection...")
-	db, err := storage.InitDB(dbPath)
+	logStartup("Initializing database connection...")
+	db, err := InitDB(dbPath)
 	if err != nil {
 		log.Fatalf("[FATAL] Failed to initialize database: %v", err)
 	}
@@ -45,18 +43,18 @@ func main() {
 
 	go func() {
 		<-c
-		log.Println("[SHUTDOWN] Received shutdown signal, closing database...")
+		logShutdown("Received shutdown signal, closing database...")
 		if err := db.Close(); err != nil {
-			log.Printf("[ERROR] Error closing database: %v", err)
+			logError("Error closing database: %v", err)
 		} else {
-			log.Println("[SHUTDOWN] Database connection closed successfully")
+			logShutdown("Database connection closed successfully")
 		}
 		os.Exit(0)
 	}()
 
 	// Setup API routes
-	log.Println("[STARTUP] Setting up API routes...")
-	router := api.NewRouter(db)
+	logStartup("Setting up API routes...")
+	router := NewRouter(db)
 
 	// Create server with timeouts
 	server := &http.Server{
@@ -67,8 +65,8 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	log.Printf("[STARTUP] Starting HTTP server on port %s...", port)
-	log.Printf("[STARTUP] Server ready to accept connections at http://localhost:%s", port)
+	logStartup("Starting HTTP server on port %s...", port)
+	logStartup("Server ready to accept connections at http://localhost:%s", port)
 
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("[FATAL] Server failed to start: %v", err)
