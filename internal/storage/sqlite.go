@@ -1,3 +1,5 @@
+// internal/storage/sqlite.go
+
 package storage
 
 import (
@@ -16,22 +18,26 @@ type DB struct {
 }
 
 type Question struct {
-	ID         int       `json:"id"`
-	Category   string    `json:"category"`
-	Question   string    `json:"question"`
-	Answer     string    `json:"answer"`
-	Keywords   []string  `json:"keywords"`
-	Difficulty string    `json:"difficulty"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	ID           int       `json:"id"`
+	Category     string    `json:"category"`
+	Question     string    `json:"question"`
+	QuestionType string    `json:"question_type"`
+	Choices      []string  `json:"choices,omitempty"`
+	Answer       string    `json:"answer"`
+	Keywords     []string  `json:"keywords"`
+	Difficulty   string    `json:"difficulty"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
 }
 
 type QuestionRequest struct {
-	Category   string   `json:"category"`
-	Question   string   `json:"question"`
-	Answer     string   `json:"answer"`
-	Keywords   []string `json:"keywords"`
-	Difficulty string   `json:"difficulty"`
+	Category     string   `json:"category"`
+	Question     string   `json:"question"`
+	QuestionType string   `json:"question_type"`
+	Choices      []string `json:"choices,omitempty"`
+	Answer       string   `json:"answer"`
+	Keywords     []string `json:"keywords"`
+	Difficulty   string   `json:"difficulty"`
 }
 
 func InitDB(dbPath string) (*DB, error) {
@@ -74,6 +80,8 @@ func createTables(db *sql.DB) error {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             category TEXT NOT NULL,
             question TEXT NOT NULL,
+            question_type TEXT NOT NULL DEFAULT 'open_text',
+            choices TEXT,
             answer TEXT NOT NULL,
             keywords TEXT,
             difficulty TEXT NOT NULL,
@@ -101,6 +109,53 @@ func createTables(db *sql.DB) error {
 		}
 	}
 
+	// Add new columns to existing questions table if they don't exist
+	log.Println("[DB] Checking for schema updates...")
+
+	// Check if question_type column exists
+	rows, err := db.Query("PRAGMA table_info(questions)")
+	if err != nil {
+		return fmt.Errorf("failed to check table info: %w", err)
+	}
+	defer rows.Close()
+
+	hasQuestionType := false
+	hasChoices := false
+
+	for rows.Next() {
+		var cid int
+		var name, dataType string
+		var notNull, pk bool
+		var defaultValue sql.NullString
+
+		err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &pk)
+		if err != nil {
+			return fmt.Errorf("failed to scan table info: %w", err)
+		}
+
+		if name == "question_type" {
+			hasQuestionType = true
+		}
+		if name == "choices" {
+			hasChoices = true
+		}
+	}
+
+	// Add missing columns
+	if !hasQuestionType {
+		log.Println("[DB] Adding question_type column...")
+		if _, err := db.Exec("ALTER TABLE questions ADD COLUMN question_type TEXT DEFAULT 'open_text'"); err != nil {
+			return fmt.Errorf("failed to add question_type column: %w", err)
+		}
+	}
+
+	if !hasChoices {
+		log.Println("[DB] Adding choices column...")
+		if _, err := db.Exec("ALTER TABLE questions ADD COLUMN choices TEXT"); err != nil {
+			return fmt.Errorf("failed to add choices column: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -109,7 +164,7 @@ func (db *DB) GetAllQuestions() ([]Question, error) {
 	start := time.Now()
 
 	rows, err := db.Query(`
-        SELECT id, category, question, answer, keywords, difficulty, created_at, updated_at 
+        SELECT id, category, question, question_type, choices, answer, keywords, difficulty, created_at, updated_at 
         FROM questions ORDER BY created_at DESC
     `)
 	if err != nil {
@@ -121,9 +176,9 @@ func (db *DB) GetAllQuestions() ([]Question, error) {
 	var questions []Question
 	for rows.Next() {
 		var q Question
-		var keywordsJSON string
+		var keywordsJSON, choicesJSON sql.NullString
 
-		err := rows.Scan(&q.ID, &q.Category, &q.Question, &q.Answer, &keywordsJSON,
+		err := rows.Scan(&q.ID, &q.Category, &q.Question, &q.QuestionType, &choicesJSON, &q.Answer, &keywordsJSON,
 			&q.Difficulty, &q.CreatedAt, &q.UpdatedAt)
 		if err != nil {
 			log.Printf("[DB ERROR] Failed to scan question row: %v", err)
@@ -131,8 +186,13 @@ func (db *DB) GetAllQuestions() ([]Question, error) {
 		}
 
 		// Parse keywords JSON
-		if keywordsJSON != "" {
-			json.Unmarshal([]byte(keywordsJSON), &q.Keywords)
+		if keywordsJSON.Valid && keywordsJSON.String != "" {
+			json.Unmarshal([]byte(keywordsJSON.String), &q.Keywords)
+		}
+
+		// Parse choices JSON
+		if choicesJSON.Valid && choicesJSON.String != "" {
+			json.Unmarshal([]byte(choicesJSON.String), &q.Choices)
 		}
 
 		questions = append(questions, q)
@@ -148,12 +208,12 @@ func (db *DB) GetQuestionByID(id int) (*Question, error) {
 	start := time.Now()
 
 	var q Question
-	var keywordsJSON string
+	var keywordsJSON, choicesJSON sql.NullString
 
 	err := db.QueryRow(`
-        SELECT id, category, question, answer, keywords, difficulty, created_at, updated_at 
+        SELECT id, category, question, question_type, choices, answer, keywords, difficulty, created_at, updated_at 
         FROM questions WHERE id = ?
-    `, id).Scan(&q.ID, &q.Category, &q.Question, &q.Answer, &keywordsJSON,
+    `, id).Scan(&q.ID, &q.Category, &q.Question, &q.QuestionType, &choicesJSON, &q.Answer, &keywordsJSON,
 		&q.Difficulty, &q.CreatedAt, &q.UpdatedAt)
 
 	if err != nil {
@@ -167,8 +227,13 @@ func (db *DB) GetQuestionByID(id int) (*Question, error) {
 	}
 
 	// Parse keywords JSON
-	if keywordsJSON != "" {
-		json.Unmarshal([]byte(keywordsJSON), &q.Keywords)
+	if keywordsJSON.Valid && keywordsJSON.String != "" {
+		json.Unmarshal([]byte(keywordsJSON.String), &q.Keywords)
+	}
+
+	// Parse choices JSON
+	if choicesJSON.Valid && choicesJSON.String != "" {
+		json.Unmarshal([]byte(choicesJSON.String), &q.Choices)
 	}
 
 	duration := time.Since(start)
@@ -177,15 +242,39 @@ func (db *DB) GetQuestionByID(id int) (*Question, error) {
 }
 
 func (db *DB) CreateQuestion(req QuestionRequest) (*Question, error) {
-	log.Printf("[DB] Creating question in category '%s'", req.Category)
+	log.Printf("[DB] Creating question in category '%s', type '%s'", req.Category, req.QuestionType)
 	start := time.Now()
+
+	// Validate question type
+	validTypes := []string{"open_text", "multiple_choice", "true_false", "multiple_select"}
+	questionType := strings.ToLower(strings.TrimSpace(req.QuestionType))
+	if questionType == "" {
+		questionType = "open_text" // Default
+	}
+
+	isValidType := false
+	for _, vt := range validTypes {
+		if questionType == vt {
+			isValidType = true
+			break
+		}
+	}
+
+	if !isValidType {
+		return nil, fmt.Errorf("invalid question type '%s', must be one of: %v", req.QuestionType, validTypes)
+	}
 
 	keywordsJSON, _ := json.Marshal(req.Keywords)
 
+	var choicesJSON []byte
+	if len(req.Choices) > 0 {
+		choicesJSON, _ = json.Marshal(req.Choices)
+	}
+
 	result, err := db.Exec(`
-        INSERT INTO questions (category, question, answer, keywords, difficulty)
-        VALUES (?, ?, ?, ?, ?)
-    `, req.Category, req.Question, req.Answer, string(keywordsJSON), req.Difficulty)
+        INSERT INTO questions (category, question, question_type, choices, answer, keywords, difficulty)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    `, req.Category, req.Question, questionType, string(choicesJSON), req.Answer, string(keywordsJSON), req.Difficulty)
 
 	if err != nil {
 		duration := time.Since(start)
@@ -200,7 +289,7 @@ func (db *DB) CreateQuestion(req QuestionRequest) (*Question, error) {
 	}
 
 	duration := time.Since(start)
-	log.Printf("[DB] Question created with ID %d in %v", id, duration)
+	log.Printf("[DB] Question created with ID %d, type '%s' in %v", id, questionType, duration)
 
 	return db.GetQuestionByID(int(id))
 }
@@ -215,14 +304,38 @@ func (db *DB) UpdateQuestion(id int, req QuestionRequest) (*Question, error) {
 		return nil, err
 	}
 
+	// Validate question type
+	validTypes := []string{"open_text", "multiple_choice", "true_false", "multiple_select"}
+	questionType := strings.ToLower(strings.TrimSpace(req.QuestionType))
+	if questionType == "" {
+		questionType = current.QuestionType // Keep existing type if not specified
+	}
+
+	isValidType := false
+	for _, vt := range validTypes {
+		if questionType == vt {
+			isValidType = true
+			break
+		}
+	}
+
+	if !isValidType {
+		return nil, fmt.Errorf("invalid question type '%s', must be one of: %v", req.QuestionType, validTypes)
+	}
+
 	keywordsJSON, _ := json.Marshal(req.Keywords)
+
+	var choicesJSON []byte
+	if len(req.Choices) > 0 {
+		choicesJSON, _ = json.Marshal(req.Choices)
+	}
 
 	// Update question
 	result, err := db.Exec(`
         UPDATE questions 
-        SET category = ?, question = ?, answer = ?, keywords = ?, difficulty = ?, updated_at = CURRENT_TIMESTAMP
+        SET category = ?, question = ?, question_type = ?, choices = ?, answer = ?, keywords = ?, difficulty = ?, updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
-    `, req.Category, req.Question, req.Answer, string(keywordsJSON), req.Difficulty, id)
+    `, req.Category, req.Question, questionType, string(choicesJSON), req.Answer, string(keywordsJSON), req.Difficulty, id)
 
 	if err != nil {
 		duration := time.Since(start)
@@ -332,11 +445,11 @@ func (db *DB) RecordProgress(userID int, req ProgressRequest) (*Progress, error)
 		return nil, err
 	}
 
-	// Simple answer checking - normalize both answers for comparison
-	isCorrect := normalizeAnswer(req.UserAnswer) == normalizeAnswer(question.Answer)
+	// Check answer based on question type
+	isCorrect := checkAnswer(question, req.UserAnswer)
 
-	log.Printf("[DB] Answer check: user='%s' vs correct='%s' -> %t",
-		req.UserAnswer, question.Answer, isCorrect)
+	log.Printf("[DB] Answer check for %s question: user='%s' vs correct='%s' -> %t",
+		question.QuestionType, req.UserAnswer, question.Answer, isCorrect)
 
 	result, err := db.Exec(`
         INSERT INTO progress (user_id, question_id, user_answer, is_correct, time_taken_seconds)
@@ -359,6 +472,67 @@ func (db *DB) RecordProgress(userID int, req ProgressRequest) (*Progress, error)
 	log.Printf("[DB] Progress recorded with ID %d (correct: %t) in %v", id, isCorrect, duration)
 
 	return db.GetProgressByID(int(id))
+}
+
+// Check answer based on question type
+func checkAnswer(question *Question, userAnswer string) bool {
+	switch question.QuestionType {
+	case "open_text":
+		return normalizeAnswer(userAnswer) == normalizeAnswer(question.Answer)
+
+	case "multiple_choice", "true_false":
+		// For multiple choice and true/false, exact match with correct answer
+		return normalizeAnswer(userAnswer) == normalizeAnswer(question.Answer)
+
+	case "multiple_select":
+		// For multiple select, the correct answer is stored as JSON array
+		var correctAnswers []string
+		if err := json.Unmarshal([]byte(question.Answer), &correctAnswers); err != nil {
+			log.Printf("[DB ERROR] Failed to parse multiple_select answer: %v", err)
+			return false
+		}
+
+		// User answer should be comma-separated values
+		userAnswers := strings.Split(userAnswer, ",")
+		for i, answer := range userAnswers {
+			userAnswers[i] = strings.TrimSpace(answer)
+		}
+
+		// Normalize both arrays for comparison
+		normalizedCorrect := make([]string, len(correctAnswers))
+		for i, answer := range correctAnswers {
+			normalizedCorrect[i] = normalizeAnswer(answer)
+		}
+
+		normalizedUser := make([]string, len(userAnswers))
+		for i, answer := range userAnswers {
+			normalizedUser[i] = normalizeAnswer(answer)
+		}
+
+		// Check if arrays contain same elements (order doesn't matter)
+		if len(normalizedCorrect) != len(normalizedUser) {
+			return false
+		}
+
+		for _, correct := range normalizedCorrect {
+			found := false
+			for _, user := range normalizedUser {
+				if correct == user {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false
+			}
+		}
+
+		return true
+
+	default:
+		log.Printf("[DB ERROR] Unknown question type: %s", question.QuestionType)
+		return false
+	}
 }
 
 func (db *DB) GetProgressByID(id int) (*Progress, error) {
@@ -499,7 +673,7 @@ func (db *DB) GetNextQuestions(userID int, count int) ([]Question, error) {
 	// 3. Questions due for review based on spaced repetition
 
 	query := `
-        SELECT DISTINCT q.id, q.category, q.question, q.answer, q.keywords, q.difficulty, q.created_at, q.updated_at,
+        SELECT DISTINCT q.id, q.category, q.question, q.question_type, q.choices, q.answer, q.keywords, q.difficulty, q.created_at, q.updated_at,
                COALESCE(last_progress.is_correct, 0) as last_correct,
                COALESCE(last_progress.answered_at, '1970-01-01') as last_answered,
                COALESCE(correct_streak.streak, 0) as streak
@@ -540,12 +714,12 @@ func (db *DB) GetNextQuestions(userID int, count int) ([]Question, error) {
 
 	for rows.Next() {
 		var q Question
-		var keywordsJSON string
+		var keywordsJSON, choicesJSON sql.NullString
 		var lastCorrect bool
 		var lastAnswered string
 		var streak int
 
-		err := rows.Scan(&q.ID, &q.Category, &q.Question, &q.Answer, &keywordsJSON,
+		err := rows.Scan(&q.ID, &q.Category, &q.Question, &q.QuestionType, &choicesJSON, &q.Answer, &keywordsJSON,
 			&q.Difficulty, &q.CreatedAt, &q.UpdatedAt,
 			&lastCorrect, &lastAnswered, &streak)
 		if err != nil {
@@ -554,8 +728,13 @@ func (db *DB) GetNextQuestions(userID int, count int) ([]Question, error) {
 		}
 
 		// Parse keywords JSON
-		if keywordsJSON != "" {
-			json.Unmarshal([]byte(keywordsJSON), &q.Keywords)
+		if keywordsJSON.Valid && keywordsJSON.String != "" {
+			json.Unmarshal([]byte(keywordsJSON.String), &q.Keywords)
+		}
+
+		// Parse choices JSON
+		if choicesJSON.Valid && choicesJSON.String != "" {
+			json.Unmarshal([]byte(choicesJSON.String), &q.Choices)
 		}
 
 		// Count question types for logging
@@ -573,6 +752,266 @@ func (db *DB) GetNextQuestions(userID int, count int) ([]Question, error) {
 		len(questions), neverAnswered, incorrectAnswers, duration)
 
 	return questions, nil
+}
+
+// Import types and functions
+type ImportRequest struct {
+	Questions []QuestionImport `json:"questions"`
+}
+
+type QuestionImport struct {
+	Category     string   `json:"category"`
+	Question     string   `json:"question"`
+	QuestionType string   `json:"question_type"`
+	Choices      []string `json:"choices,omitempty"`
+	Answer       string   `json:"answer"`
+	Keywords     []string `json:"keywords"`
+	Difficulty   string   `json:"difficulty"`
+}
+
+type ImportResult struct {
+	TotalQuestions    int      `json:"total_questions"`
+	ImportedQuestions int      `json:"imported_questions"`
+	SkippedQuestions  int      `json:"skipped_questions"`
+	Errors            []string `json:"errors"`
+	TimeTaken         string   `json:"time_taken"`
+}
+
+// Import questions from JSON
+func (db *DB) ImportQuestions(importReq ImportRequest) (*ImportResult, error) {
+	log.Printf("[IMPORT] Starting import of %d questions", len(importReq.Questions))
+	start := time.Now()
+
+	result := &ImportResult{
+		TotalQuestions: len(importReq.Questions),
+		Errors:         make([]string, 0),
+	}
+
+	// Start transaction for better performance and consistency
+	tx, err := db.Begin()
+	if err != nil {
+		log.Printf("[IMPORT ERROR] Failed to start transaction: %v", err)
+		return nil, err
+	}
+	defer tx.Rollback() // Will be ignored if we commit successfully
+
+	log.Println("[IMPORT] Transaction started")
+
+	// Prepare statement for better performance
+	stmt, err := tx.Prepare(`
+		INSERT INTO questions (category, question, question_type, choices, answer, keywords, difficulty)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		log.Printf("[IMPORT ERROR] Failed to prepare statement: %v", err)
+		return nil, err
+	}
+	defer stmt.Close()
+
+	// Track duplicates
+	existingQuestions := make(map[string]bool)
+	rows, err := db.Query("SELECT question FROM questions")
+	if err != nil {
+		log.Printf("[IMPORT ERROR] Failed to fetch existing questions: %v", err)
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var existingQuestion string
+		if err := rows.Scan(&existingQuestion); err != nil {
+			log.Printf("[IMPORT ERROR] Failed to scan existing question: %v", err)
+			continue
+		}
+		existingQuestions[strings.ToLower(strings.TrimSpace(existingQuestion))] = true
+	}
+
+	log.Printf("[IMPORT] Found %d existing questions to check for duplicates", len(existingQuestions))
+
+	// Process each question
+	for i, q := range importReq.Questions {
+		log.Printf("[IMPORT] Processing question %d/%d: category='%s'", i+1, len(importReq.Questions), q.Category)
+
+		// Validate required fields
+		if strings.TrimSpace(q.Question) == "" {
+			errMsg := fmt.Sprintf("Question %d: empty question text", i+1)
+			log.Printf("[IMPORT SKIP] %s", errMsg)
+			result.Errors = append(result.Errors, errMsg)
+			result.SkippedQuestions++
+			continue
+		}
+
+		if strings.TrimSpace(q.Answer) == "" {
+			errMsg := fmt.Sprintf("Question %d: empty answer", i+1)
+			log.Printf("[IMPORT SKIP] %s", errMsg)
+			result.Errors = append(result.Errors, errMsg)
+			result.SkippedQuestions++
+			continue
+		}
+
+		if strings.TrimSpace(q.Category) == "" {
+			errMsg := fmt.Sprintf("Question %d: empty category", i+1)
+			log.Printf("[IMPORT SKIP] %s", errMsg)
+			result.Errors = append(result.Errors, errMsg)
+			result.SkippedQuestions++
+			continue
+		}
+
+		// Validate question type and choices
+		questionType := strings.ToLower(strings.TrimSpace(q.QuestionType))
+		if questionType == "" {
+			questionType = "open_text" // Default
+			log.Printf("[IMPORT] Question %d: using default question type 'open_text'", i+1)
+		}
+
+		validTypes := []string{"open_text", "multiple_choice", "true_false", "multiple_select"}
+		isValidType := false
+		for _, vt := range validTypes {
+			if questionType == vt {
+				isValidType = true
+				break
+			}
+		}
+
+		if !isValidType {
+			errMsg := fmt.Sprintf("Question %d: invalid question type '%s', must be one of: %v", i+1, q.QuestionType, validTypes)
+			log.Printf("[IMPORT SKIP] %s", errMsg)
+			result.Errors = append(result.Errors, errMsg)
+			result.SkippedQuestions++
+			continue
+		}
+
+		// Validate choices for multiple choice questions
+		if (questionType == "multiple_choice" || questionType == "multiple_select") && len(q.Choices) < 2 {
+			errMsg := fmt.Sprintf("Question %d: %s questions must have at least 2 choices", i+1, questionType)
+			log.Printf("[IMPORT SKIP] %s", errMsg)
+			result.Errors = append(result.Errors, errMsg)
+			result.SkippedQuestions++
+			continue
+		}
+
+		// Validate answer is in choices for multiple choice
+		if questionType == "multiple_choice" {
+			answerInChoices := false
+			for _, choice := range q.Choices {
+				if normalizeAnswer(choice) == normalizeAnswer(q.Answer) {
+					answerInChoices = true
+					break
+				}
+			}
+			if !answerInChoices {
+				errMsg := fmt.Sprintf("Question %d: answer '%s' not found in choices", i+1, q.Answer)
+				log.Printf("[IMPORT SKIP] %s", errMsg)
+				result.Errors = append(result.Errors, errMsg)
+				result.SkippedQuestions++
+				continue
+			}
+		}
+
+		// For multiple_select, convert answer to JSON array if it's a comma-separated string
+		answer := strings.TrimSpace(q.Answer)
+		if questionType == "multiple_select" {
+			// Check if answer is already JSON
+			var testArray []string
+			if err := json.Unmarshal([]byte(answer), &testArray); err != nil {
+				// Not JSON, treat as comma-separated and convert
+				answers := strings.Split(answer, ",")
+				for i, a := range answers {
+					answers[i] = strings.TrimSpace(a)
+				}
+				if answerJSON, err := json.Marshal(answers); err == nil {
+					answer = string(answerJSON)
+					log.Printf("[IMPORT] Question %d: converted comma-separated answer to JSON", i+1)
+				}
+			}
+		}
+
+		// Validate difficulty
+		difficulty := strings.ToLower(strings.TrimSpace(q.Difficulty))
+		if difficulty == "" {
+			difficulty = "medium" // Default
+			log.Printf("[IMPORT] Question %d: using default difficulty 'medium'", i+1)
+		} else if difficulty != "easy" && difficulty != "medium" && difficulty != "hard" {
+			errMsg := fmt.Sprintf("Question %d: invalid difficulty '%s', must be easy/medium/hard", i+1, q.Difficulty)
+			log.Printf("[IMPORT SKIP] %s", errMsg)
+			result.Errors = append(result.Errors, errMsg)
+			result.SkippedQuestions++
+			continue
+		}
+
+		// Check for duplicates
+		questionKey := strings.ToLower(strings.TrimSpace(q.Question))
+		if existingQuestions[questionKey] {
+			errMsg := fmt.Sprintf("Question %d: duplicate question already exists", i+1)
+			log.Printf("[IMPORT SKIP] %s", errMsg)
+			result.Errors = append(result.Errors, errMsg)
+			result.SkippedQuestions++
+			continue
+		}
+
+		// Marshal keywords and choices
+		keywordsJSON, err := json.Marshal(q.Keywords)
+		if err != nil {
+			errMsg := fmt.Sprintf("Question %d: failed to marshal keywords: %v", i+1, err)
+			log.Printf("[IMPORT SKIP] %s", errMsg)
+			result.Errors = append(result.Errors, errMsg)
+			result.SkippedQuestions++
+			continue
+		}
+
+		var choicesJSON []byte
+		if len(q.Choices) > 0 {
+			choicesJSON, err = json.Marshal(q.Choices)
+			if err != nil {
+				errMsg := fmt.Sprintf("Question %d: failed to marshal choices: %v", i+1, err)
+				log.Printf("[IMPORT SKIP] %s", errMsg)
+				result.Errors = append(result.Errors, errMsg)
+				result.SkippedQuestions++
+				continue
+			}
+		}
+
+		// Insert question
+		_, err = stmt.Exec(
+			strings.TrimSpace(q.Category),
+			strings.TrimSpace(q.Question),
+			questionType,
+			string(choicesJSON),
+			answer,
+			string(keywordsJSON),
+			difficulty,
+		)
+
+		if err != nil {
+			errMsg := fmt.Sprintf("Question %d: database insert failed: %v", i+1, err)
+			log.Printf("[IMPORT ERROR] %s", errMsg)
+			result.Errors = append(result.Errors, errMsg)
+			result.SkippedQuestions++
+			continue
+		}
+
+		// Mark as existing to prevent duplicates within this import
+		existingQuestions[questionKey] = true
+		result.ImportedQuestions++
+
+		if (i+1)%10 == 0 || i+1 == len(importReq.Questions) {
+			log.Printf("[IMPORT] Progress: %d/%d questions processed", i+1, len(importReq.Questions))
+		}
+	}
+
+	// Commit transaction
+	if err := tx.Commit(); err != nil {
+		log.Printf("[IMPORT ERROR] Failed to commit transaction: %v", err)
+		return nil, err
+	}
+
+	duration := time.Since(start)
+	result.TimeTaken = duration.String()
+
+	log.Printf("[IMPORT] Import completed: %d imported, %d skipped, %d errors in %v",
+		result.ImportedQuestions, result.SkippedQuestions, len(result.Errors), duration)
+
+	return result, nil
 }
 
 // Helper function to normalize answers for comparison
