@@ -1,15 +1,14 @@
 package main
 
 import (
+	"french-citizenship-api/internal/api"
+	"french-citizenship-api/internal/storage"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
-
-	"french-citizenship-api/internal/api"
-	"french-citizenship-api/internal/storage"
 )
 
 func main() {
