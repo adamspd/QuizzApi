@@ -52,25 +52,25 @@ jobs:
             cd ~/api/french-citizenship-api
           
             # Deploy with Docker Compose
-            docker-compose down || true
+            docker compose down || true
             docker rmi french-citizenship-api_api || true
-            docker-compose up -d --build
+            docker compose up -d --build
           
             # Show status
             echo '=== Container Status ==='
-            docker-compose ps
+            docker compose ps
           
             echo '=== API Logs ==='
-            docker-compose logs --tail=20 api
+            docker compose logs --tail=20 api
           
             # Health check
             echo 'Waiting for API to start...'
             sleep 20
           
-            if ! docker-compose ps | grep -q 'Up'; then
+            if ! docker compose ps | grep -q 'Up'; then
               echo 'ERROR: API container is not running'
-              docker-compose ps
-              docker-compose logs api
+              docker compose ps
+              docker compose logs api
               exit 1
             fi
           
@@ -79,7 +79,7 @@ jobs:
               echo 'API deployment successful!'
             else
               echo 'API health check: FAILED'
-              docker-compose logs api
+              docker compose logs api
               exit 1
             fi
           "
