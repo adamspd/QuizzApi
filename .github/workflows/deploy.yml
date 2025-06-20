@@ -27,24 +27,37 @@ jobs:
 
       - name: Deploy Files
         run: |
-          # Create directories
+          # Create directories and backup .env
           ssh ${{ secrets.PI_USER }}@${{ secrets.PI_HOST }} "
-            # Check if .env exists, exit if not
-            if [ ! -f ~/api/french-citizenship-api/.env ]; then
+            # Create directories
+            mkdir -p ~/api/french-citizenship-api/data
+            mkdir -p ~/api/french-citizenship-api/logs
+          
+            # Backup .env file if it exists
+            if [ -f ~/api/french-citizenship-api/.env ]; then
+              /bin/cp ~/api/french-citizenship-api/.env ~/api/.env.backup
+              echo '.env file backed up'
+            else
               echo 'ERROR: .env file not found at ~/api/french-citizenship-api/.env'
               echo 'Please create the .env file first before deploying'
               exit 1
             fi
-            # Create directories
-            mkdir -p ~/api/french-citizenship-api/data
-            mkdir -p ~/api/french-citizenship-api/logs
           "
           
-          # Copy files using rsync
-          rsync -avz --delete \
+          # Copy files using rsync (without --delete to preserve .env)
+          rsync -avz \
             -e "ssh -o StrictHostKeyChecking=no" \
             ./ \
             ${{ secrets.PI_USER }}@${{ secrets.PI_HOST }}:~/api/french-citizenship-api/
+          
+          # Restore .env file
+          ssh ${{ secrets.PI_USER }}@${{ secrets.PI_HOST }} "
+            # Restore .env file
+            /bin/cp ~/api/.env.backup ~/api/french-citizenship-api/.env
+            rm ~/api/.env.backup
+            echo '.env file restored'
+            ls -la ~/api/french-citizenship-api/.env
+          "
 
       - name: Deploy with Docker
         run: |
