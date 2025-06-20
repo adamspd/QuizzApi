@@ -30,26 +30,26 @@ jobs:
           # Create directories
           ssh ${{ secrets.PI_USER }}@${{ secrets.PI_HOST }} "
             # Check if .env exists, exit if not
-            if [ ! -f \$HOME/api/french-citizenship-api/.env ]; then
-              echo 'ERROR: .env file not found at \$HOME/api/french-citizenship-api/.env'
+            if [ ! -f ~/api/french-citizenship-api/.env ]; then
+              echo 'ERROR: .env file not found at ~/api/french-citizenship-api/.env'
               echo 'Please create the .env file first before deploying'
               exit 1
             fi
             # Create directories
-            mkdir -p \$HOME/api/french-citizenship-api/data
-            mkdir -p \$HOME/api/french-citizenship-api/logs
+            mkdir -p ~/api/french-citizenship-api/data
+            mkdir -p ~/api/french-citizenship-api/logs
           "
           
           # Copy files using rsync
           rsync -avz --delete \
             -e "ssh -o StrictHostKeyChecking=no" \
             ./ \
-            ${{ secrets.PI_USER }}@${{ secrets.PI_HOST }}:\$HOME/api/french-citizenship-api/
+            ${{ secrets.PI_USER }}@${{ secrets.PI_HOST }}:~/api/french-citizenship-api/
 
       - name: Deploy with Docker
         run: |
           ssh ${{ secrets.PI_USER }}@${{ secrets.PI_HOST }} "
-            cd \$HOME/api/french-citizenship-api
+            cd ~/api/french-citizenship-api
           
             # Deploy with Docker Compose
             docker-compose down || true
