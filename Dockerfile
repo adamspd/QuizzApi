@@ -1,5 +1,5 @@
 # Dockerfile
-FROM golang:1.21-alpine AS builder
+FROM golang:1.23-alpine AS builder
 
 # Install dependencies
 RUN apk add --no-cache git gcc musl-dev sqlite-dev
@@ -15,6 +15,9 @@ RUN go mod download
 
 # Copy source code
 COPY *.go ./
+
+# Get any missing dependencies
+RUN go mod tidy
 
 # Build the application
 RUN CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o main .
