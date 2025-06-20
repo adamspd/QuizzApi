@@ -30,7 +30,7 @@ func InitDB(dbPath string) (*DB, error) {
 
 	logStartup("Database connection established")
 
-	if err := createTables(db); err != nil {
+	if err := createTablesWithAuth(db); err != nil {
 		logError("Failed to create tables: %v", err)
 		return nil, err
 	}
@@ -39,106 +39,127 @@ func InitDB(dbPath string) (*DB, error) {
 	return &DB{db}, nil
 }
 
-func createTables(db *sql.DB) error {
+func createTablesWithAuth(db *sql.DB) error {
 	queries := []string{
+		// Users table
 		`CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'user',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )`,
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			username TEXT UNIQUE NOT NULL,
+			email TEXT UNIQUE NOT NULL,
+			password_hash TEXT NOT NULL,
+			role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('user', 'moderator', 'admin')),
+			is_active BOOLEAN NOT NULL DEFAULT 1,
+			email_verified BOOLEAN NOT NULL DEFAULT 0,
+			email_verified_at DATETIME,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)`,
 
+		// Email verification tokens table
+		`CREATE TABLE IF NOT EXISTS email_verifications (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL,
+			email TEXT NOT NULL,
+			token TEXT UNIQUE NOT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			expires_at DATETIME NOT NULL,
+			used_at DATETIME,
+			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+		)`,
+
+		// Updated questions table
 		`CREATE TABLE IF NOT EXISTS questions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category TEXT NOT NULL,
-            question TEXT NOT NULL,
-            question_type TEXT NOT NULL DEFAULT 'open_text',
-            choices TEXT,
-            answer TEXT NOT NULL,
-            keywords TEXT,
-            difficulty TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )`,
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			category TEXT NOT NULL,
+			question TEXT NOT NULL,
+			question_type TEXT NOT NULL DEFAULT 'open_text',
+			choices TEXT,
+			answer TEXT NOT NULL,
+			keywords TEXT,
+			difficulty TEXT NOT NULL,
+			created_by INTEGER NOT NULL DEFAULT 1,
+			status TEXT NOT NULL DEFAULT 'approved' CHECK (status IN ('pending', 'approved', 'rejected')),
+			approved_by INTEGER,
+			approved_at DATETIME,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (created_by) REFERENCES users(id),
+			FOREIGN KEY (approved_by) REFERENCES users(id)
+		)`,
 
+		// Progress table (already exists, just ensure foreign key)
 		`CREATE TABLE IF NOT EXISTS progress (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            question_id INTEGER NOT NULL,
-            user_answer TEXT NOT NULL,
-            is_correct BOOLEAN NOT NULL,
-            answered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            time_taken_seconds INTEGER,
-            FOREIGN KEY (user_id) REFERENCES users(id),
-            FOREIGN KEY (question_id) REFERENCES questions(id)
-        )`,
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL,
+			question_id INTEGER NOT NULL,
+			user_answer TEXT NOT NULL,
+			is_correct BOOLEAN NOT NULL,
+			answered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			time_taken_seconds INTEGER,
+			FOREIGN KEY (user_id) REFERENCES users(id),
+			FOREIGN KEY (question_id) REFERENCES questions(id)
+		)`,
 	}
 
 	for i, query := range queries {
-		logDB("Creating table %d/3", i+1)
+		logDB("Creating table %d/%d", i+1, len(queries))
 		if _, err := db.Exec(query); err != nil {
 			return fmt.Errorf("failed to create table: %w", err)
 		}
 	}
 
-	logDB("Checking for schema updates...")
-
-	rows, err := db.Query("PRAGMA table_info(questions)")
-	if err != nil {
-		return fmt.Errorf("failed to check table info: %w", err)
-	}
-	defer rows.Close()
-
-	hasQuestionType := false
-	hasChoices := false
-
-	for rows.Next() {
-		var cid int
-		var name, dataType string
-		var notNull, pk bool
-		var defaultValue sql.NullString
-
-		err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &pk)
-		if err != nil {
-			return fmt.Errorf("failed to scan table info: %w", err)
-		}
-
-		if name == "question_type" {
-			hasQuestionType = true
-		}
-		if name == "choices" {
-			hasChoices = true
-		}
+	// Create indexes
+	indexes := []string{
+		"CREATE INDEX IF NOT EXISTS idx_questions_status ON questions(status)",
+		"CREATE INDEX IF NOT EXISTS idx_questions_created_by ON questions(created_by)",
+		"CREATE INDEX IF NOT EXISTS idx_progress_user_id ON progress(user_id)",
+		"CREATE INDEX IF NOT EXISTS idx_email_verifications_token ON email_verifications(token)",
+		"CREATE INDEX IF NOT EXISTS idx_email_verifications_user_id ON email_verifications(user_id)",
 	}
 
-	if !hasQuestionType {
-		logDB("Adding question_type column...")
-		if _, err := db.Exec("ALTER TABLE questions ADD COLUMN question_type TEXT DEFAULT 'open_text'"); err != nil {
-			return fmt.Errorf("failed to add question_type column: %w", err)
-		}
-	}
-
-	if !hasChoices {
-		logDB("Adding choices column...")
-		if _, err := db.Exec("ALTER TABLE questions ADD COLUMN choices TEXT"); err != nil {
-			return fmt.Errorf("failed to add choices column: %w", err)
+	for _, index := range indexes {
+		if _, err := db.Exec(index); err != nil {
+			logDB("Failed to create index (non-fatal): %v", err)
 		}
 	}
 
 	return nil
 }
 
-func (db *DB) GetAllQuestions() ([]Question, error) {
-	logDB("Executing query: GetAllQuestions")
+func (db *DB) GetAllQuestionsForUser(userID int, userRole string) ([]Question, error) {
+	logDB("Getting questions for user %d (role: %s)", userID, userRole)
 	start := time.Now()
 
-	rows, err := db.Query(`
-        SELECT id, category, question, question_type, choices, answer, keywords, difficulty, created_at, updated_at 
-        FROM questions ORDER BY created_at DESC
-    `)
+	var query string
+	var args []interface{}
+
+	if userRole == "admin" || userRole == "moderator" {
+		// Admins and moderators see all questions
+		query = `
+			SELECT q.id, q.category, q.question, q.question_type, q.choices, q.answer, q.keywords, q.difficulty,
+				   q.created_by, q.status, q.approved_by, q.approved_at, q.created_at, q.updated_at,
+				   u.username as creator_username
+			FROM questions q
+			LEFT JOIN users u ON q.created_by = u.id
+			ORDER BY q.created_at DESC
+		`
+	} else {
+		// Regular users see approved questions + their own pending questions
+		query = `
+			SELECT q.id, q.category, q.question, q.question_type, q.choices, q.answer, q.keywords, q.difficulty,
+				   q.created_by, q.status, q.approved_by, q.approved_at, q.created_at, q.updated_at,
+				   u.username as creator_username
+			FROM questions q
+			LEFT JOIN users u ON q.created_by = u.id
+			WHERE q.status = 'approved' OR (q.created_by = ? AND q.status = 'pending')
+			ORDER BY q.created_at DESC
+		`
+		args = append(args, userID)
+	}
+
+	rows, err := db.Query(query, args...)
 	if err != nil {
-		logError("GetAllQuestions query failed: %v", err)
+		logError("GetAllQuestionsForUser query failed: %v", err)
 		return nil, err
 	}
 	defer rows.Close()
@@ -149,7 +170,8 @@ func (db *DB) GetAllQuestions() ([]Question, error) {
 		var keywordsJSON, choicesJSON sql.NullString
 
 		err := rows.Scan(&q.ID, &q.Category, &q.Question, &q.QuestionType, &choicesJSON, &q.Answer, &keywordsJSON,
-			&q.Difficulty, &q.CreatedAt, &q.UpdatedAt)
+			&q.Difficulty, &q.CreatedBy, &q.Status, &q.ApprovedBy, &q.ApprovedAt, &q.CreatedAt, &q.UpdatedAt,
+			&q.CreatorUsername)
 		if err != nil {
 			logError("Failed to scan question row: %v", err)
 			return nil, err
@@ -167,7 +189,7 @@ func (db *DB) GetAllQuestions() ([]Question, error) {
 	}
 
 	duration := time.Since(start)
-	logDB("GetAllQuestions completed: %d questions in %v", len(questions), duration)
+	logDB("GetAllQuestionsForUser completed: %d questions in %v", len(questions), duration)
 	return questions, nil
 }
 
@@ -207,8 +229,8 @@ func (db *DB) GetQuestionByID(id int) (*Question, error) {
 	return &q, nil
 }
 
-func (db *DB) CreateQuestion(req QuestionRequest) (*Question, error) {
-	logDB("Creating question in category '%s', type '%s'", req.Category, req.QuestionType)
+func (db *DB) CreateQuestionWithAuth(req QuestionRequest, createdBy int, userRole string) (*Question, error) {
+	logDB("Creating question by user %d (role: %s)", createdBy, userRole)
 	start := time.Now()
 
 	validTypes := []string{"open_text", "multiple_choice", "true_false", "multiple_select"}
@@ -229,6 +251,16 @@ func (db *DB) CreateQuestion(req QuestionRequest) (*Question, error) {
 		return nil, fmt.Errorf("invalid question type '%s', must be one of: %v", req.QuestionType, validTypes)
 	}
 
+	// Set status based on user role
+	status := req.Status
+	if status == "" {
+		if userRole == "admin" {
+			status = "approved"
+		} else {
+			status = "pending"
+		}
+	}
+
 	keywordsJSON, _ := json.Marshal(req.Keywords)
 
 	var choicesJSON []byte
@@ -237,13 +269,13 @@ func (db *DB) CreateQuestion(req QuestionRequest) (*Question, error) {
 	}
 
 	result, err := db.Exec(`
-        INSERT INTO questions (category, question, question_type, choices, answer, keywords, difficulty)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    `, req.Category, req.Question, questionType, string(choicesJSON), req.Answer, string(keywordsJSON), req.Difficulty)
+		INSERT INTO questions (category, question, question_type, choices, answer, keywords, difficulty, created_by, status)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, req.Category, req.Question, questionType, string(choicesJSON), req.Answer, string(keywordsJSON), req.Difficulty, createdBy, status)
 
 	if err != nil {
 		duration := time.Since(start)
-		logError("CreateQuestion failed: %v (%v)", err, duration)
+		logError("CreateQuestionWithAuth failed: %v (%v)", err, duration)
 		return nil, err
 	}
 
@@ -254,18 +286,24 @@ func (db *DB) CreateQuestion(req QuestionRequest) (*Question, error) {
 	}
 
 	duration := time.Since(start)
-	logDB("Question created with ID %d, type '%s' in %v", id, questionType, duration)
+	logDB("Question created with ID %d, status '%s' by user %d in %v", id, status, createdBy, duration)
 
 	return db.GetQuestionByID(int(id))
 }
 
-func (db *DB) UpdateQuestion(id int, req QuestionRequest) (*Question, error) {
-	logDB("Updating question ID %d", id)
+func (db *DB) UpdateQuestionWithAuth(id int, req QuestionRequest, userID int, userRole string) (*Question, error) {
+	logDB("Updating question ID %d by user %d (role: %s)", id, userID, userRole)
 	start := time.Now()
 
 	current, err := db.GetQuestionByID(id)
 	if err != nil {
 		return nil, err
+	}
+
+	// Check permissions
+	session := &Session{UserID: userID, Role: userRole}
+	if !session.CanEditQuestion(current) {
+		return nil, fmt.Errorf("insufficient permissions to edit this question")
 	}
 
 	validTypes := []string{"open_text", "multiple_choice", "true_false", "multiple_select"}
@@ -286,6 +324,12 @@ func (db *DB) UpdateQuestion(id int, req QuestionRequest) (*Question, error) {
 		return nil, fmt.Errorf("invalid question type '%s', must be one of: %v", req.QuestionType, validTypes)
 	}
 
+	// Handle status changes
+	status := current.Status
+	if req.Status != "" && (userRole == "admin" || userRole == "moderator") {
+		status = req.Status
+	}
+
 	keywordsJSON, _ := json.Marshal(req.Keywords)
 
 	var choicesJSON []byte
@@ -293,23 +337,37 @@ func (db *DB) UpdateQuestion(id int, req QuestionRequest) (*Question, error) {
 		choicesJSON, _ = json.Marshal(req.Choices)
 	}
 
+	var approvedBy *int
+	var approvedAt interface{}
+
+	if status == "approved" && current.Status != "approved" {
+		approvedBy = &userID
+		approvedAt = "CURRENT_TIMESTAMP"
+	} else if current.ApprovedBy != nil {
+		approvedBy = current.ApprovedBy
+		approvedAt = current.ApprovedAt
+	}
+
 	result, err := db.Exec(`
-        UPDATE questions 
-        SET category = ?, question = ?, question_type = ?, choices = ?, answer = ?, keywords = ?, difficulty = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-    `, req.Category, req.Question, questionType, string(choicesJSON), req.Answer, string(keywordsJSON), req.Difficulty, id)
+		UPDATE questions 
+		SET category = ?, question = ?, question_type = ?, choices = ?, answer = ?, keywords = ?, 
+		    difficulty = ?, status = ?, approved_by = ?, approved_at = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ?
+	`, req.Category, req.Question, questionType, string(choicesJSON), req.Answer, string(keywordsJSON),
+		req.Difficulty, status, approvedBy, approvedAt, id)
 
 	if err != nil {
 		duration := time.Since(start)
-		logError("UpdateQuestion(%d) failed: %v (%v)", id, err, duration)
+		logError("UpdateQuestionWithAuth(%d) failed: %v (%v)", id, err, duration)
 		return nil, err
 	}
 
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		logDB("UpdateQuestion(%d): no rows affected", id)
+		logDB("UpdateQuestionWithAuth(%d): no rows affected", id)
 	}
 
+	// Clear progress if answer changed
 	if current.Answer != req.Answer {
 		logDB("Answer changed for question %d, clearing progress", id)
 		deleteResult, err := db.Exec("DELETE FROM progress WHERE question_id = ?", id)
@@ -322,7 +380,7 @@ func (db *DB) UpdateQuestion(id int, req QuestionRequest) (*Question, error) {
 	}
 
 	duration := time.Since(start)
-	logDB("UpdateQuestion(%d) completed in %v", id, duration)
+	logDB("UpdateQuestionWithAuth(%d) completed in %v", id, duration)
 
 	return db.GetQuestionByID(id)
 }
@@ -518,42 +576,45 @@ func (db *DB) getCurrentStreak(userID int) int {
 	return streak
 }
 
-func (db *DB) GetNextQuestions(userID int, count int) ([]Question, error) {
+func (db *DB) GetNextQuestionsForUser(userID int, count int) ([]Question, error) {
 	logDB("Getting next %d questions for user %d", count, userID)
 	start := time.Now()
 
+	// Only show approved questions for practice
 	query := `
-        SELECT DISTINCT q.id, q.category, q.question, q.question_type, q.choices, q.answer, q.keywords, q.difficulty, q.created_at, q.updated_at,
-               COALESCE(last_progress.is_correct, 0) as last_correct,
-               COALESCE(last_progress.answered_at, '1970-01-01') as last_answered,
-               COALESCE(correct_streak.streak, 0) as streak
-        FROM questions q
-        LEFT JOIN (
-            SELECT question_id, is_correct, answered_at,
-                   ROW_NUMBER() OVER (PARTITION BY question_id ORDER BY answered_at DESC) as rn
-            FROM progress WHERE user_id = ?
-        ) last_progress ON q.id = last_progress.question_id AND last_progress.rn = 1
-        LEFT JOIN (
-            SELECT question_id, COUNT(*) as streak
-            FROM (
-                SELECT question_id, is_correct,
-                       ROW_NUMBER() OVER (PARTITION BY question_id ORDER BY answered_at DESC) as rn
-                FROM progress WHERE user_id = ?
-            ) recent_progress
-            WHERE rn <= 10 AND is_correct = 1
-            GROUP BY question_id
-        ) correct_streak ON q.id = correct_streak.question_id
-        ORDER BY 
-            CASE WHEN last_progress.answered_at IS NULL THEN 0 ELSE 1 END,
-            CASE WHEN last_progress.is_correct = 0 THEN 0 ELSE 1 END,
-            last_progress.answered_at ASC
-        LIMIT ?
-    `
+		SELECT DISTINCT q.id, q.category, q.question, q.question_type, q.choices, q.answer, q.keywords, q.difficulty, 
+			   q.created_by, q.status, q.approved_by, q.approved_at, q.created_at, q.updated_at,
+			   COALESCE(last_progress.is_correct, 0) as last_correct,
+			   COALESCE(last_progress.answered_at, '1970-01-01') as last_answered,
+			   COALESCE(correct_streak.streak, 0) as streak
+		FROM questions q
+		LEFT JOIN (
+			SELECT question_id, is_correct, answered_at,
+				   ROW_NUMBER() OVER (PARTITION BY question_id ORDER BY answered_at DESC) as rn
+			FROM progress WHERE user_id = ?
+		) last_progress ON q.id = last_progress.question_id AND last_progress.rn = 1
+		LEFT JOIN (
+			SELECT question_id, COUNT(*) as streak
+			FROM (
+				SELECT question_id, is_correct,
+					   ROW_NUMBER() OVER (PARTITION BY question_id ORDER BY answered_at DESC) as rn
+				FROM progress WHERE user_id = ?
+			) recent_progress
+			WHERE rn <= 10 AND is_correct = 1
+			GROUP BY question_id
+		) correct_streak ON q.id = correct_streak.question_id
+		WHERE q.status = 'approved'
+		ORDER BY 
+			CASE WHEN last_progress.answered_at IS NULL THEN 0 ELSE 1 END,
+			CASE WHEN last_progress.is_correct = 0 THEN 0 ELSE 1 END,
+			last_progress.answered_at ASC
+		LIMIT ?
+	`
 
 	rows, err := db.Query(query, userID, userID, count)
 	if err != nil {
 		duration := time.Since(start)
-		logError("GetNextQuestions failed: %v (%v)", err, duration)
+		logError("GetNextQuestionsForUser failed: %v (%v)", err, duration)
 		return nil, err
 	}
 	defer rows.Close()
@@ -570,7 +631,7 @@ func (db *DB) GetNextQuestions(userID int, count int) ([]Question, error) {
 		var streak int
 
 		err := rows.Scan(&q.ID, &q.Category, &q.Question, &q.QuestionType, &choicesJSON, &q.Answer, &keywordsJSON,
-			&q.Difficulty, &q.CreatedAt, &q.UpdatedAt,
+			&q.Difficulty, &q.CreatedBy, &q.Status, &q.ApprovedBy, &q.ApprovedAt, &q.CreatedAt, &q.UpdatedAt,
 			&lastCorrect, &lastAnswered, &streak)
 		if err != nil {
 			logError("Failed to scan next question row: %v", err)
@@ -595,7 +656,7 @@ func (db *DB) GetNextQuestions(userID int, count int) ([]Question, error) {
 	}
 
 	duration := time.Since(start)
-	logDB("GetNextQuestions completed: %d questions (%d never answered, %d incorrect) in %v",
+	logDB("GetNextQuestionsForUser completed: %d questions (%d never answered, %d incorrect) in %v",
 		len(questions), neverAnswered, incorrectAnswers, duration)
 
 	return questions, nil
@@ -818,4 +879,285 @@ func (db *DB) ImportQuestions(importReq ImportRequest) (*ImportResult, error) {
 		result.ImportedQuestions, result.SkippedQuestions, len(result.Errors), duration)
 
 	return result, nil
+}
+
+func (db *DB) CreateUser(req UserRequest) (*User, error) {
+	logDB("Creating user: %s (%s)", req.Username, req.Email)
+	start := time.Now()
+
+	// Validate the request
+	if err := validateUserRequest(&req, false); err != nil {
+		return nil, err
+	}
+
+	// Hash the password
+	hashedPassword, err := hashPassword(req.Password)
+	if err != nil {
+		logError("Failed to hash password: %v", err)
+		return nil, err
+	}
+
+	// Set default role if not specified
+	role := req.Role
+	if role == "" {
+		role = "user"
+	}
+
+	// Set default active status
+	isActive := true
+	if req.IsActive != nil {
+		isActive = *req.IsActive
+	}
+
+	result, err := db.Exec(`
+		INSERT INTO users (username, email, password_hash, role, is_active)
+		VALUES (?, ?, ?, ?, ?)
+	`, req.Username, req.Email, hashedPassword, role, isActive)
+
+	if err != nil {
+		duration := time.Since(start)
+		logError("CreateUser failed: %v (%v)", err, duration)
+		return nil, err
+	}
+
+	id, err := result.LastInsertId()
+	if err != nil {
+		logError("Failed to get LastInsertId for user: %v", err)
+		return nil, err
+	}
+
+	duration := time.Since(start)
+	logDB("User created with ID %d in %v", id, duration)
+
+	return db.GetUserByID(int(id))
+}
+
+func (db *DB) GetUserByID(id int) (*User, error) {
+	logDB("Getting user by ID: %d", id)
+
+	var user User
+	err := db.QueryRow(`
+		SELECT id, username, email, role, is_active, email_verified, email_verified_at, created_at, updated_at
+		FROM users WHERE id = ?
+	`, id).Scan(&user.ID, &user.Username, &user.Email, &user.Role, &user.IsActive,
+		&user.EmailVerified, &user.EmailVerifiedAt, &user.CreatedAt, &user.UpdatedAt)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			logDB("User ID %d not found", id)
+		} else {
+			logError("GetUserByID(%d) failed: %v", id, err)
+		}
+		return nil, err
+	}
+
+	return &user, nil
+}
+
+func (db *DB) GetUserByUsername(username string) (*User, error) {
+	logDB("Getting user by username: %s", username)
+
+	var user User
+	err := db.QueryRow(`
+		SELECT id, username, email, role, is_active, email_verified, email_verified_at, created_at, updated_at
+		FROM users WHERE username = ?
+	`, username).Scan(&user.ID, &user.Username, &user.Email, &user.Role, &user.IsActive,
+		&user.EmailVerified, &user.EmailVerifiedAt, &user.CreatedAt, &user.UpdatedAt)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			logDB("User %s not found", username)
+		} else {
+			logError("GetUserByUsername(%s) failed: %v", username, err)
+		}
+		return nil, err
+	}
+
+	return &user, nil
+}
+
+func (db *DB) GetUserByEmail(email string) (*User, error) {
+	logDB("Getting user by email: %s", email)
+
+	var user User
+	err := db.QueryRow(`
+		SELECT id, username, email, role, is_active, email_verified, email_verified_at, created_at, updated_at
+		FROM users WHERE email = ?
+	`, email).Scan(&user.ID, &user.Username, &user.Email, &user.Role, &user.IsActive,
+		&user.EmailVerified, &user.EmailVerifiedAt, &user.CreatedAt, &user.UpdatedAt)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			logDB("User with email %s not found", email)
+		} else {
+			logError("GetUserByEmail(%s) failed: %v", email, err)
+		}
+		return nil, err
+	}
+
+	return &user, nil
+}
+
+func (db *DB) AuthenticateUser(username, password string) (*User, error) {
+	logDB("Authenticating user: %s", username)
+
+	var user User
+	var passwordHash string
+
+	err := db.QueryRow(`
+		SELECT id, username, email, role, is_active, email_verified, email_verified_at, 
+		       created_at, updated_at, password_hash
+		FROM users WHERE username = ? AND is_active = 1
+	`, username).Scan(&user.ID, &user.Username, &user.Email, &user.Role, &user.IsActive,
+		&user.EmailVerified, &user.EmailVerifiedAt, &user.CreatedAt, &user.UpdatedAt, &passwordHash)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			logDB("Authentication failed: user %s not found or inactive", username)
+		} else {
+			logError("AuthenticateUser(%s) failed: %v", username, err)
+		}
+		return nil, fmt.Errorf("invalid credentials")
+	}
+
+	// Check password
+	if !checkPassword(passwordHash, password) {
+		logDB("Authentication failed: invalid password for user %s", username)
+		return nil, fmt.Errorf("invalid credentials")
+	}
+
+	logDB("User %s authenticated successfully", username)
+	return &user, nil
+}
+
+func (db *DB) UpdateUser(id int, req UserRequest) (*User, error) {
+	logDB("Updating user ID %d", id)
+	start := time.Now()
+
+	// Validate the request
+	if err := validateUserRequest(&req, true); err != nil {
+		return nil, err
+	}
+
+	// Check if user exists
+	currentUser, err := db.GetUserByID(id)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build update query dynamically
+	var setParts []string
+	var args []interface{}
+
+	if req.Username != "" && req.Username != currentUser.Username {
+		setParts = append(setParts, "username = ?")
+		args = append(args, req.Username)
+	}
+
+	if req.Email != "" && req.Email != currentUser.Email {
+		setParts = append(setParts, "email = ?, email_verified = 0, email_verified_at = NULL")
+		args = append(args, req.Email)
+	}
+
+	if req.Password != "" {
+		hashedPassword, err := hashPassword(req.Password)
+		if err != nil {
+			return nil, err
+		}
+		setParts = append(setParts, "password_hash = ?")
+		args = append(args, hashedPassword)
+	}
+
+	if req.Role != "" && req.Role != currentUser.Role {
+		setParts = append(setParts, "role = ?")
+		args = append(args, req.Role)
+	}
+
+	if req.IsActive != nil && *req.IsActive != currentUser.IsActive {
+		setParts = append(setParts, "is_active = ?")
+		args = append(args, *req.IsActive)
+	}
+
+	if len(setParts) == 0 {
+		logDB("UpdateUser(%d): no changes to apply", id)
+		return currentUser, nil
+	}
+
+	setParts = append(setParts, "updated_at = CURRENT_TIMESTAMP")
+	args = append(args, id)
+
+	query := fmt.Sprintf("UPDATE users SET %s WHERE id = ?", strings.Join(setParts, ", "))
+
+	result, err := db.Exec(query, args...)
+	if err != nil {
+		duration := time.Since(start)
+		logError("UpdateUser(%d) failed: %v (%v)", id, err, duration)
+		return nil, err
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	duration := time.Since(start)
+
+	if rowsAffected == 0 {
+		logDB("UpdateUser(%d): no rows affected (%v)", id, duration)
+	} else {
+		logDB("UpdateUser(%d) completed in %v", id, duration)
+	}
+
+	return db.GetUserByID(id)
+}
+
+func (db *DB) DeleteUser(id int) error {
+	logDB("Deleting user ID %d", id)
+	start := time.Now()
+
+	result, err := db.Exec("UPDATE users SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?", id)
+	if err != nil {
+		duration := time.Since(start)
+		logError("Failed to delete user %d: %v (%v)", id, err, duration)
+		return err
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	duration := time.Since(start)
+
+	if rowsAffected == 0 {
+		logDB("DeleteUser(%d): no rows affected (%v)", id, duration)
+		return fmt.Errorf("user not found")
+	} else {
+		logDB("DeleteUser(%d) completed in %v", id, duration)
+	}
+
+	return nil
+}
+
+func (db *DB) GetAllUsers() ([]User, error) {
+	logDB("Getting all users")
+	start := time.Now()
+
+	rows, err := db.Query(`
+		SELECT id, username, email, role, is_active, email_verified, email_verified_at, created_at, updated_at
+		FROM users ORDER BY created_at DESC
+	`)
+	if err != nil {
+		logError("GetAllUsers query failed: %v", err)
+		return nil, err
+	}
+	defer rows.Close()
+
+	var users []User
+	for rows.Next() {
+		var user User
+		err := rows.Scan(&user.ID, &user.Username, &user.Email, &user.Role, &user.IsActive,
+			&user.EmailVerified, &user.EmailVerifiedAt, &user.CreatedAt, &user.UpdatedAt)
+		if err != nil {
+			logError("Failed to scan user row: %v", err)
+			return nil, err
+		}
+		users = append(users, user)
+	}
+
+	duration := time.Since(start)
+	logDB("GetAllUsers completed: %d users in %v", len(users), duration)
+	return users, nil
 }
