@@ -14,50 +14,66 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Deploy to Server
-        uses: easingthemes/ssh-deploy@v5.1.0
-        with:
-          REMOTE_HOST: ${{ secrets.PI_HOST }}
-          REMOTE_USER: ${{ secrets.PI_USER }}
-          SSH_PRIVATE_KEY: ${{ secrets.PI_SSH_KEY }}
-          SCRIPT_BEFORE: |
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.PI_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.PI_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Test SSH Connection
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.PI_USER }}@${{ secrets.PI_HOST }} "echo 'SSH connection successful'; whoami; pwd"
+
+      - name: Deploy Files
+        run: |
+          # Create directories
+          ssh ${{ secrets.PI_USER }}@${{ secrets.PI_HOST }} "
             # Check if .env exists, exit if not
-            if [ ! -f $HOME/api/french-citizenship-api/.env ]; then
-              echo "ERROR: .env file not found at $HOME/api/french-citizenship-api/.env"
-              echo "Please create the .env file first before deploying"
+            if [ ! -f \$HOME/api/french-citizenship-api/.env ]; then
+              echo 'ERROR: .env file not found at \$HOME/api/french-citizenship-api/.env'
+              echo 'Please create the .env file first before deploying'
               exit 1
             fi
             # Create directories
-            mkdir -p $HOME/api/french-citizenship-api/data
-            mkdir -p $HOME/api/french-citizenship-api/logs
-          SOURCE: '.'
-          TARGET: '$HOME/api/french-citizenship-api'
-          SCRIPT_AFTER: |
-            cd $HOME/api/french-citizenship-api
-            
+            mkdir -p \$HOME/api/french-citizenship-api/data
+            mkdir -p \$HOME/api/french-citizenship-api/logs
+          "
+          
+          # Copy files using rsync
+          rsync -avz --delete \
+            -e "ssh -o StrictHostKeyChecking=no" \
+            ./ \
+            ${{ secrets.PI_USER }}@${{ secrets.PI_HOST }}:\$HOME/api/french-citizenship-api/
+
+      - name: Deploy with Docker
+        run: |
+          ssh ${{ secrets.PI_USER }}@${{ secrets.PI_HOST }} "
+            cd \$HOME/api/french-citizenship-api
+          
             # Deploy with Docker Compose
             docker-compose down || true
             docker rmi french-citizenship-api_api || true
             docker-compose up -d --build
-            
+          
             # Show status
             echo '=== Container Status ==='
             docker-compose ps
-            
+          
             echo '=== API Logs ==='
             docker-compose logs --tail=20 api
-            
+          
             # Health check
-            echo "Waiting for API to start..."
+            echo 'Waiting for API to start...'
             sleep 20
-            
+          
             if ! docker-compose ps | grep -q 'Up'; then
               echo 'ERROR: API container is not running'
               docker-compose ps
               docker-compose logs api
               exit 1
             fi
-            
+          
             if curl -f http://localhost:8043/health > /dev/null 2>&1; then
               echo 'API health check: PASSED'
               echo 'API deployment successful!'
@@ -66,3 +82,9 @@ jobs:
               docker-compose logs api
               exit 1
             fi
+          "
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f ~/.ssh/id_rsa
