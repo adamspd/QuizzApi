@@ -1,4 +1,4 @@
-module french-citizenship-api
+module github.com/adamspd/QuizzApi
 
 go 1.23.0
 
