@@ -40,18 +40,19 @@ type ApprovalRequest struct {
 }
 
 // Import types
+
 type ImportRequest struct {
 	Questions []QuestionImport `json:"questions"`
 }
 
 type QuestionImport struct {
-	Category     string   `json:"category"`
-	Question     string   `json:"question"`
-	QuestionType string   `json:"question_type"`
-	Choices      []string `json:"choices,omitempty"`
-	Answer       string   `json:"answer"`
-	Keywords     []string `json:"keywords"`
-	Difficulty   string   `json:"difficulty"`
+	Category     string      `json:"category"`
+	Question     string      `json:"question"`
+	QuestionType string      `json:"question_type"`
+	Choices      []string    `json:"choices,omitempty"`
+	Answer       interface{} `json:"answer"`
+	Keywords     []string    `json:"keywords"`
+	Difficulty   string      `json:"difficulty"`
 }
 
 type ImportResult struct {

@@ -433,6 +433,15 @@ func (db *DB) ImportQuestions(importReq models.ImportRequest) (*models.ImportRes
 		Errors:         make([]string, 0),
 	}
 
+	// Basic validation
+	if len(importReq.Questions) == 0 {
+		return result, fmt.Errorf("no questions provided")
+	}
+	if len(importReq.Questions) > 1000 {
+		return result, fmt.Errorf("too many questions (max 1000 per import)")
+	}
+
+	// Start transaction
 	tx, err := db.Begin()
 	if err != nil {
 		utils.LogError("Failed to start transaction: %v", err)
@@ -440,8 +449,43 @@ func (db *DB) ImportQuestions(importReq models.ImportRequest) (*models.ImportRes
 	}
 	defer tx.Rollback()
 
-	utils.LogImport("Transaction started")
+	// Prepare statement
+	stmt, err := db.prepareImportStatement(tx)
+	if err != nil {
+		return nil, err
+	}
+	defer stmt.Close()
 
+	// Get existing questions for duplicate check
+	existingQuestions, err := db.getExistingQuestions()
+	if err != nil {
+		return nil, err
+	}
+
+	// Process each question
+	for i, q := range importReq.Questions {
+		if err := db.processQuestion(i+1, q, stmt, existingQuestions, result); err != nil {
+			// Error already logged and added to result
+			continue
+		}
+	}
+
+	// Commit transaction
+	if err := tx.Commit(); err != nil {
+		utils.LogError("Failed to commit transaction: %v", err)
+		return nil, err
+	}
+
+	duration := time.Since(start)
+	result.TimeTaken = duration.String()
+
+	utils.LogImport("Import completed: %d imported, %d skipped, %d errors in %v",
+		result.ImportedQuestions, result.SkippedQuestions, len(result.Errors), duration)
+
+	return result, nil
+}
+
+func (db *DB) prepareImportStatement(tx *sql.Tx) (*sql.Stmt, error) {
 	stmt, err := tx.Prepare(`
 		INSERT INTO questions (category, question, question_type, choices, answer, keywords, difficulty)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -450,8 +494,10 @@ func (db *DB) ImportQuestions(importReq models.ImportRequest) (*models.ImportRes
 		utils.LogError("Failed to prepare statement: %v", err)
 		return nil, err
 	}
-	defer stmt.Close()
+	return stmt, nil
+}
 
+func (db *DB) getExistingQuestions() (map[string]bool, error) {
 	existingQuestions := make(map[string]bool)
 	rows, err := db.Query("SELECT question FROM questions")
 	if err != nil {
@@ -470,178 +516,304 @@ func (db *DB) ImportQuestions(importReq models.ImportRequest) (*models.ImportRes
 	}
 
 	utils.LogImport("Found %d existing questions to check for duplicates", len(existingQuestions))
+	return existingQuestions, nil
+}
 
-	for i, q := range importReq.Questions {
-		utils.LogImport("Processing question %d/%d: category='%s'", i+1, len(importReq.Questions), q.Category)
+func (db *DB) processQuestion(questionNum int, q models.QuestionImport, stmt *sql.Stmt, existingQuestions map[string]bool, result *models.ImportResult) error {
+	utils.LogImport("Processing question %d/%d: category='%s'", questionNum, result.TotalQuestions, q.Category)
 
-		if strings.TrimSpace(q.Question) == "" {
-			errMsg := fmt.Sprintf("Question %d: empty question text", i+1)
-			utils.LogImport("SKIP: %s", errMsg)
-			result.Errors = append(result.Errors, errMsg)
-			result.SkippedQuestions++
-			continue
+	// Basic validation
+	if err := db.validateBasicFields(questionNum, q, result); err != nil {
+		return err
+	}
+
+	// Validate and normalize question type
+	questionType, err := db.validateQuestionType(questionNum, q, result)
+	if err != nil {
+		return err
+	}
+
+	// Validate choices for multiple choice/select questions
+	if err := db.validateChoices(questionNum, q, questionType, result); err != nil {
+		return err
+	}
+
+	// Process and validate answer
+	finalAnswer, err := db.processAnswer(questionNum, q, questionType, result)
+	if err != nil {
+		return err
+	}
+
+	// Validate difficulty
+	difficulty, err := db.validateDifficulty(questionNum, q, result)
+	if err != nil {
+		return err
+	}
+
+	// Check for duplicates
+	questionKey := strings.ToLower(strings.TrimSpace(q.Question))
+	if existingQuestions[questionKey] {
+		errMsg := fmt.Sprintf("Question %d: duplicate question already exists", questionNum)
+		utils.LogImport("SKIP: %s", errMsg)
+		result.Errors = append(result.Errors, errMsg)
+		result.SkippedQuestions++
+		return fmt.Errorf("duplicate")
+	}
+
+	// Marshal JSON fields
+	keywordsJSON, choicesJSON, err := db.marshalJSONFields(questionNum, q, result)
+	if err != nil {
+		return err
+	}
+
+	// Insert into database
+	_, err = stmt.Exec(
+		strings.TrimSpace(q.Category),
+		strings.TrimSpace(q.Question),
+		questionType,
+		string(choicesJSON),
+		finalAnswer,
+		string(keywordsJSON),
+		difficulty,
+	)
+
+	if err != nil {
+		errMsg := fmt.Sprintf("Question %d: database insert failed: %v", questionNum, err)
+		utils.LogError("%s", errMsg)
+		result.Errors = append(result.Errors, errMsg)
+		result.SkippedQuestions++
+		return err
+	}
+
+	// Success!
+	existingQuestions[questionKey] = true
+	result.ImportedQuestions++
+
+	if questionNum%10 == 0 || questionNum == result.TotalQuestions {
+		utils.LogImport("Progress: %d/%d questions processed", questionNum, result.TotalQuestions)
+	}
+
+	return nil
+}
+
+func (db *DB) validateBasicFields(questionNum int, q models.QuestionImport, result *models.ImportResult) error {
+	if strings.TrimSpace(q.Question) == "" {
+		errMsg := fmt.Sprintf("Question %d: empty question text", questionNum)
+		utils.LogImport("SKIP: %s", errMsg)
+		result.Errors = append(result.Errors, errMsg)
+		result.SkippedQuestions++
+		return fmt.Errorf("empty question")
+	}
+
+	if q.Answer == nil || q.Answer == "" {
+		errMsg := fmt.Sprintf("Question %d: empty answer", questionNum)
+		utils.LogImport("SKIP: %s", errMsg)
+		result.Errors = append(result.Errors, errMsg)
+		result.SkippedQuestions++
+		return fmt.Errorf("empty answer")
+	}
+
+	if strings.TrimSpace(q.Category) == "" {
+		errMsg := fmt.Sprintf("Question %d: empty category", questionNum)
+		utils.LogImport("SKIP: %s", errMsg)
+		result.Errors = append(result.Errors, errMsg)
+		result.SkippedQuestions++
+		return fmt.Errorf("empty category")
+	}
+
+	return nil
+}
+
+func (db *DB) validateQuestionType(questionNum int, q models.QuestionImport, result *models.ImportResult) (string, error) {
+	questionType := strings.ToLower(strings.TrimSpace(q.QuestionType))
+	if questionType == "" {
+		questionType = "open_text"
+		utils.LogImport("Question %d: using default question type 'open_text'", questionNum)
+	}
+
+	validTypes := []string{"open_text", "multiple_choice", "true_false", "multiple_select"}
+	for _, vt := range validTypes {
+		if questionType == vt {
+			return questionType, nil
 		}
+	}
 
-		if strings.TrimSpace(q.Answer) == "" {
-			errMsg := fmt.Sprintf("Question %d: empty answer", i+1)
-			utils.LogImport("SKIP: %s", errMsg)
-			result.Errors = append(result.Errors, errMsg)
-			result.SkippedQuestions++
-			continue
-		}
+	errMsg := fmt.Sprintf("Question %d: invalid question type '%s', must be one of: %v", questionNum, q.QuestionType, validTypes)
+	utils.LogImport("SKIP: %s", errMsg)
+	result.Errors = append(result.Errors, errMsg)
+	result.SkippedQuestions++
+	return "", fmt.Errorf("invalid question type")
+}
 
-		if strings.TrimSpace(q.Category) == "" {
-			errMsg := fmt.Sprintf("Question %d: empty category", i+1)
-			utils.LogImport("SKIP: %s", errMsg)
-			result.Errors = append(result.Errors, errMsg)
-			result.SkippedQuestions++
-			continue
-		}
+func (db *DB) validateChoices(questionNum int, q models.QuestionImport, questionType string, result *models.ImportResult) error {
+	if (questionType == "multiple_choice" || questionType == "multiple_select") && len(q.Choices) < 2 {
+		errMsg := fmt.Sprintf("Question %d: %s questions must have at least 2 choices", questionNum, questionType)
+		utils.LogImport("SKIP: %s", errMsg)
+		result.Errors = append(result.Errors, errMsg)
+		result.SkippedQuestions++
+		return fmt.Errorf("insufficient choices")
+	}
+	return nil
+}
 
-		questionType := strings.ToLower(strings.TrimSpace(q.QuestionType))
-		if questionType == "" {
-			questionType = "open_text"
-			utils.LogImport("Question %d: using default question type 'open_text'", i+1)
-		}
+func (db *DB) processAnswer(questionNum int, q models.QuestionImport, questionType string, result *models.ImportResult) (string, error) {
+	switch answerValue := q.Answer.(type) {
+	case string:
+		answer := strings.TrimSpace(answerValue)
 
-		validTypes := []string{"open_text", "multiple_choice", "true_false", "multiple_select"}
-		isValidType := false
-		for _, vt := range validTypes {
-			if questionType == vt {
-				isValidType = true
-				break
+		// For multiple_select, try to parse as JSON array first
+		if questionType == "multiple_select" {
+			if strings.HasPrefix(answer, "[") && strings.HasSuffix(answer, "]") {
+				// Already JSON, validate it
+				var testArray []string
+				if err := json.Unmarshal([]byte(answer), &testArray); err != nil {
+					errMsg := fmt.Sprintf("Question %d: invalid JSON array in answer: %v", questionNum, err)
+					utils.LogImport("SKIP: %s", errMsg)
+					result.Errors = append(result.Errors, errMsg)
+					result.SkippedQuestions++
+					return "", err
+				}
+				return answer, nil
+			} else {
+				// Comma-separated, convert to JSON
+				answers := strings.Split(answer, ",")
+				for i, a := range answers {
+					answers[i] = strings.TrimSpace(a)
+				}
+				answerJSON, err := json.Marshal(answers)
+				if err != nil {
+					errMsg := fmt.Sprintf("Question %d: failed to marshal comma-separated answer: %v", questionNum, err)
+					utils.LogImport("SKIP: %s", errMsg)
+					result.Errors = append(result.Errors, errMsg)
+					result.SkippedQuestions++
+					return "", err
+				}
+				return string(answerJSON), nil
 			}
 		}
 
-		if !isValidType {
-			errMsg := fmt.Sprintf("Question %d: invalid question type '%s', must be one of: %v", i+1, q.QuestionType, validTypes)
-			utils.LogImport("SKIP: %s", errMsg)
-			result.Errors = append(result.Errors, errMsg)
-			result.SkippedQuestions++
-			continue
-		}
-
-		if (questionType == "multiple_choice" || questionType == "multiple_select") && len(q.Choices) < 2 {
-			errMsg := fmt.Sprintf("Question %d: %s questions must have at least 2 choices", i+1, questionType)
-			utils.LogImport("SKIP: %s", errMsg)
-			result.Errors = append(result.Errors, errMsg)
-			result.SkippedQuestions++
-			continue
-		}
-
+		// For multiple_choice, validate answer is in choices
 		if questionType == "multiple_choice" {
 			answerInChoices := false
 			for _, choice := range q.Choices {
-				if utils.NormalizeAnswer(choice) == utils.NormalizeAnswer(q.Answer) {
+				if utils.NormalizeAnswer(choice) == utils.NormalizeAnswer(answer) {
 					answerInChoices = true
 					break
 				}
 			}
 			if !answerInChoices {
-				errMsg := fmt.Sprintf("Question %d: answer '%s' not found in choices", i+1, q.Answer)
+				errMsg := fmt.Sprintf("Question %d: answer '%s' not found in choices", questionNum, answer)
 				utils.LogImport("SKIP: %s", errMsg)
 				result.Errors = append(result.Errors, errMsg)
 				result.SkippedQuestions++
-				continue
+				return "", fmt.Errorf("answer not in choices")
 			}
 		}
 
-		answer := strings.TrimSpace(q.Answer)
-		if questionType == "multiple_select" {
-			// If it's already a proper JSON array, keep it
-			if strings.HasPrefix(strings.TrimSpace(q.Answer), "[") {
-				answer = strings.TrimSpace(q.Answer)
+		return answer, nil
+
+	case []interface{}:
+		// Convert []interface{} to []string
+		var answers []string
+		for _, v := range answerValue {
+			if str, ok := v.(string); ok {
+				answers = append(answers, str)
 			} else {
-				// Handle comma-separated fallback
-				answers := strings.Split(q.Answer, ",")
-				for i, a := range answers {
-					answers[i] = strings.TrimSpace(a)
-				}
-				answerJSON, _ := json.Marshal(answers)
-				answer = string(answerJSON)
-			}
-		} else {
-			answer = strings.TrimSpace(q.Answer)
-		}
-
-		difficulty := strings.ToLower(strings.TrimSpace(q.Difficulty))
-		if difficulty == "" {
-			difficulty = "medium"
-			utils.LogImport("Question %d: using default difficulty 'medium'", i+1)
-		} else if difficulty != "easy" && difficulty != "medium" && difficulty != "hard" {
-			errMsg := fmt.Sprintf("Question %d: invalid difficulty '%s', must be easy/medium/hard", i+1, q.Difficulty)
-			utils.LogImport("SKIP: %s", errMsg)
-			result.Errors = append(result.Errors, errMsg)
-			result.SkippedQuestions++
-			continue
-		}
-
-		questionKey := strings.ToLower(strings.TrimSpace(q.Question))
-		if existingQuestions[questionKey] {
-			errMsg := fmt.Sprintf("Question %d: duplicate question already exists", i+1)
-			utils.LogImport("SKIP: %s", errMsg)
-			result.Errors = append(result.Errors, errMsg)
-			result.SkippedQuestions++
-			continue
-		}
-
-		keywordsJSON, err := json.Marshal(q.Keywords)
-		if err != nil {
-			errMsg := fmt.Sprintf("Question %d: failed to marshal keywords: %v", i+1, err)
-			utils.LogImport("SKIP: %s", errMsg)
-			result.Errors = append(result.Errors, errMsg)
-			result.SkippedQuestions++
-			continue
-		}
-
-		var choicesJSON []byte
-		if len(q.Choices) > 0 {
-			choicesJSON, err = json.Marshal(q.Choices)
-			if err != nil {
-				errMsg := fmt.Sprintf("Question %d: failed to marshal choices: %v", i+1, err)
+				errMsg := fmt.Sprintf("Question %d: all answer array elements must be strings", questionNum)
 				utils.LogImport("SKIP: %s", errMsg)
 				result.Errors = append(result.Errors, errMsg)
 				result.SkippedQuestions++
-				continue
+				return "", fmt.Errorf("non-string in answer array")
 			}
 		}
 
-		_, err = stmt.Exec(
-			strings.TrimSpace(q.Category),
-			strings.TrimSpace(q.Question),
-			questionType,
-			string(choicesJSON),
-			answer,
-			string(keywordsJSON),
-			difficulty,
-		)
-
-		if err != nil {
-			errMsg := fmt.Sprintf("Question %d: database insert failed: %v", i+1, err)
-			utils.LogError("%s", errMsg)
+		if len(answers) == 0 {
+			errMsg := fmt.Sprintf("Question %d: empty answer array", questionNum)
+			utils.LogImport("SKIP: %s", errMsg)
 			result.Errors = append(result.Errors, errMsg)
 			result.SkippedQuestions++
-			continue
+			return "", fmt.Errorf("empty answer array")
 		}
 
-		existingQuestions[questionKey] = true
-		result.ImportedQuestions++
+		answerJSON, err := json.Marshal(answers)
+		if err != nil {
+			errMsg := fmt.Sprintf("Question %d: failed to marshal answer array: %v", questionNum, err)
+			utils.LogImport("SKIP: %s", errMsg)
+			result.Errors = append(result.Errors, errMsg)
+			result.SkippedQuestions++
+			return "", err
+		}
+		return string(answerJSON), nil
 
-		if (i+1)%10 == 0 || i+1 == len(importReq.Questions) {
-			utils.LogImport("Progress: %d/%d questions processed", i+1, len(importReq.Questions))
+	case []string:
+		// Direct string array
+		if len(answerValue) == 0 {
+			errMsg := fmt.Sprintf("Question %d: empty answer array", questionNum)
+			utils.LogImport("SKIP: %s", errMsg)
+			result.Errors = append(result.Errors, errMsg)
+			result.SkippedQuestions++
+			return "", fmt.Errorf("empty answer array")
+		}
+
+		answerJSON, err := json.Marshal(answerValue)
+		if err != nil {
+			errMsg := fmt.Sprintf("Question %d: failed to marshal answer array: %v", questionNum, err)
+			utils.LogImport("SKIP: %s", errMsg)
+			result.Errors = append(result.Errors, errMsg)
+			result.SkippedQuestions++
+			return "", err
+		}
+		return string(answerJSON), nil
+
+	default:
+		errMsg := fmt.Sprintf("Question %d: invalid answer type, must be string or array", questionNum)
+		utils.LogImport("SKIP: %s", errMsg)
+		result.Errors = append(result.Errors, errMsg)
+		result.SkippedQuestions++
+		return "", fmt.Errorf("invalid answer type")
+	}
+}
+
+func (db *DB) validateDifficulty(questionNum int, q models.QuestionImport, result *models.ImportResult) (string, error) {
+	difficulty := strings.ToLower(strings.TrimSpace(q.Difficulty))
+	if difficulty == "" {
+		difficulty = "medium"
+		utils.LogImport("Question %d: using default difficulty 'medium'", questionNum)
+		return difficulty, nil
+	}
+
+	if difficulty != "easy" && difficulty != "medium" && difficulty != "hard" {
+		errMsg := fmt.Sprintf("Question %d: invalid difficulty '%s', must be easy/medium/hard", questionNum, q.Difficulty)
+		utils.LogImport("SKIP: %s", errMsg)
+		result.Errors = append(result.Errors, errMsg)
+		result.SkippedQuestions++
+		return "", fmt.Errorf("invalid difficulty")
+	}
+
+	return difficulty, nil
+}
+
+func (db *DB) marshalJSONFields(questionNum int, q models.QuestionImport, result *models.ImportResult) ([]byte, []byte, error) {
+	keywordsJSON, err := json.Marshal(q.Keywords)
+	if err != nil {
+		errMsg := fmt.Sprintf("Question %d: failed to marshal keywords: %v", questionNum, err)
+		utils.LogImport("SKIP: %s", errMsg)
+		result.Errors = append(result.Errors, errMsg)
+		result.SkippedQuestions++
+		return nil, nil, err
+	}
+
+	var choicesJSON []byte
+	if len(q.Choices) > 0 {
+		choicesJSON, err = json.Marshal(q.Choices)
+		if err != nil {
+			errMsg := fmt.Sprintf("Question %d: failed to marshal choices: %v", questionNum, err)
+			utils.LogImport("SKIP: %s", errMsg)
+			result.Errors = append(result.Errors, errMsg)
+			result.SkippedQuestions++
+			return nil, nil, err
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
-		utils.LogError("Failed to commit transaction: %v", err)
-		return nil, err
-	}
-
-	duration := time.Since(start)
-	result.TimeTaken = duration.String()
-
-	utils.LogImport("Import completed: %d imported, %d skipped, %d errors in %v",
-		result.ImportedQuestions, result.SkippedQuestions, len(result.Errors), duration)
-
-	return result, nil
+	return keywordsJSON, choicesJSON, nil
 }
