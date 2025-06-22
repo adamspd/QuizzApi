@@ -207,6 +207,7 @@ func (db *DB) CreateQuestionWithAuth(req models.QuestionRequest, createdBy int, 
 
 func (db *DB) UpdateQuestionWithAuth(id int, req models.QuestionRequest, userID int, userRole string) (*models.Question, error) {
 	utils.LogDB("Updating question ID %d by user %d (role: %s)", id, userID, userRole)
+	utils.LogDB("Question request: %+v", req)
 	start := time.Now()
 
 	current, err := db.GetQuestionByID(id)
@@ -238,10 +239,21 @@ func (db *DB) UpdateQuestionWithAuth(id int, req models.QuestionRequest, userID 
 		return nil, fmt.Errorf("invalid question type '%s', must be one of: %v", req.QuestionType, validTypes)
 	}
 
-	// Handle status changes
-	status := current.Status
-	if req.Status != "" && (userRole == "admin" || userRole == "moderator") {
-		status = req.Status
+	// Determine status based on user role - ignore req.Status completely
+	var newStatus string
+	var approvedBy *int
+	var approvedAt interface{}
+
+	if userRole == "admin" || userRole == "moderator" {
+		// Admins/moderators auto-approve their edits
+		newStatus = "approved"
+		approvedBy = &userID
+		approvedAt = time.Now()
+	} else {
+		// Regular users always create pending questions regardless of what they edit
+		newStatus = "pending"
+		approvedBy = nil
+		approvedAt = nil
 	}
 
 	keywordsJSON, _ := json.Marshal(req.Keywords)
@@ -251,24 +263,13 @@ func (db *DB) UpdateQuestionWithAuth(id int, req models.QuestionRequest, userID 
 		choicesJSON, _ = json.Marshal(req.Choices)
 	}
 
-	var approvedBy *int
-	var approvedAt interface{}
-
-	if status == "approved" && current.Status != "approved" {
-		approvedBy = &userID
-		approvedAt = "CURRENT_TIMESTAMP"
-	} else if current.ApprovedBy != nil {
-		approvedBy = current.ApprovedBy
-		approvedAt = current.ApprovedAt
-	}
-
 	result, err := db.Exec(`
 		UPDATE questions 
 		SET category = ?, question = ?, question_type = ?, choices = ?, answer = ?, keywords = ?, 
 		    difficulty = ?, status = ?, approved_by = ?, approved_at = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE id = ?
 	`, req.Category, req.Question, questionType, string(choicesJSON), req.Answer, string(keywordsJSON),
-		req.Difficulty, status, approvedBy, approvedAt, id)
+		req.Difficulty, newStatus, approvedBy, approvedAt, id)
 
 	if err != nil {
 		duration := time.Since(start)
@@ -294,7 +295,7 @@ func (db *DB) UpdateQuestionWithAuth(id int, req models.QuestionRequest, userID 
 	}
 
 	duration := time.Since(start)
-	utils.LogDB("UpdateQuestionWithAuth(%d) completed in %v", id, duration)
+	utils.LogDB("UpdateQuestionWithAuth(%d) completed in %v with status '%s'", id, duration, newStatus)
 
 	return db.GetQuestionByID(id)
 }
