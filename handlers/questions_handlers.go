@@ -228,7 +228,15 @@ func (qh *QuestionHandlers) GetNextQuestions(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	count := 10
+	// Get user preferences for question count
+	preferences, _ := qh.db.GetUserPreferences(session.UserID)
+	if preferences == nil {
+		utils.LogHTTP("No preferences found for user %s, using default count", session.Username)
+		preferences = &models.UserPreferences{PracticeSessionLength: 10} // Default to 10 if no preferences
+	}
+	count := preferences.PracticeSessionLength
+
+	// Override count if specified in query parameters
 	if countStr := r.URL.Query().Get("count"); countStr != "" {
 		if c, err := strconv.Atoi(countStr); err == nil && c > 0 && c <= 50 {
 			count = c
