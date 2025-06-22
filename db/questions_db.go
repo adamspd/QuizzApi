@@ -333,11 +333,20 @@ func (db *DB) DeleteQuestion(id int) error {
 	return nil
 }
 
+// Enhanced GetNextQuestionsForUser in questions_db.go
 func (db *DB) GetNextQuestionsForUser(userID int, count int) ([]models.Question, error) {
-	utils.LogDB("Getting next %d questions for user %d", count, userID)
+	utils.LogDB("Getting next %d questions for user %d with preferences", count, userID)
 	start := time.Now()
 
-	// Only show approved questions for practice
+	// Get user preferences first
+	preferences, err := db.GetUserPreferences(userID)
+	if err != nil {
+		utils.LogError("Failed to get preferences for user %d: %v", userID, err)
+		// Continue with defaults if preferences fail
+		preferences = models.GetDefaultPreferences(userID)
+	}
+
+	// Build base query
 	query := `
 		SELECT DISTINCT q.id, q.category, q.question, q.question_type, q.choices, q.answer, q.keywords, q.difficulty, 
 			   q.created_by, q.status, q.approved_by, q.approved_at, q.created_at, q.updated_at,
@@ -360,15 +369,60 @@ func (db *DB) GetNextQuestionsForUser(userID int, count int) ([]models.Question,
 			WHERE rn <= 10 AND is_correct = 1
 			GROUP BY question_id
 		) correct_streak ON q.id = correct_streak.question_id
-		WHERE q.status = 'approved'
-		ORDER BY 
+		WHERE q.status = 'approved'`
+
+	var args []interface{}
+	args = append(args, userID, userID)
+
+	// Apply difficulty preference filter
+	if preferences.DifficultyPreference != "adaptive" && preferences.DifficultyPreference != "mixed" {
+		query += " AND q.difficulty = ?"
+		args = append(args, preferences.DifficultyPreference)
+		utils.LogDB("Filtering by difficulty: %s", preferences.DifficultyPreference)
+	}
+
+	// Apply category preference filter
+	if preferences.CategoryPreference != nil && len(preferences.CategoryPreference) > 0 {
+		placeholders := strings.Repeat("?,", len(preferences.CategoryPreference))
+		placeholders = placeholders[:len(placeholders)-1] // Remove trailing comma
+		query += fmt.Sprintf(" AND q.category IN (%s)", placeholders)
+
+		for _, category := range preferences.CategoryPreference {
+			args = append(args, category)
+		}
+		utils.LogDB("Filtering by categories: %v", preferences.CategoryPreference)
+	}
+
+	// Apply skip answered questions filter
+	if preferences.SkipAnsweredQuestions {
+		// Skip questions answered correctly in the last 2 days
+		query += ` AND (last_progress.answered_at IS NULL 
+			OR last_progress.is_correct = 0 
+			OR last_progress.answered_at < datetime('now', '-2 days'))`
+		utils.LogDB("Skipping recently answered correct questions")
+	}
+
+	// Apply ordering based on preferences
+	if preferences.QuestionRandomization {
+		// True randomization
+		query += " ORDER BY RANDOM()"
+		utils.LogDB("Using random question order")
+	} else {
+		// Smart prioritization (existing logic)
+		query += ` ORDER BY 
 			CASE WHEN last_progress.answered_at IS NULL THEN 0 ELSE 1 END,
 			CASE WHEN last_progress.is_correct = 0 THEN 0 ELSE 1 END,
-			last_progress.answered_at ASC
-		LIMIT ?
-	`
+			last_progress.answered_at ASC`
+		utils.LogDB("Using smart question prioritization")
+	}
 
-	rows, err := db.Query(query, userID, userID, count)
+	query += " LIMIT ?"
+	args = append(args, count)
+
+	// utils.LogDB("Final query: %s", query)
+	// utils.LogDB("Query args: %v", args)
+
+	rows, err := db.Query(query, args...)
 	if err != nil {
 		duration := time.Since(start)
 		utils.LogError("GetNextQuestionsForUser failed: %v (%v)", err, duration)
@@ -420,6 +474,10 @@ func (db *DB) GetNextQuestionsForUser(userID int, count int) ([]models.Question,
 	duration := time.Since(start)
 	utils.LogDB("GetNextQuestionsForUser completed: %d questions (%d never answered, %d incorrect) in %v",
 		len(questions), neverAnswered, incorrectAnswers, duration)
+
+	utils.LogDB("Applied preferences - Difficulty: %s, Categories: %v, Skip answered: %t, Randomize: %t",
+		preferences.DifficultyPreference, preferences.CategoryPreference,
+		preferences.SkipAnsweredQuestions, preferences.QuestionRandomization)
 
 	return questions, nil
 }

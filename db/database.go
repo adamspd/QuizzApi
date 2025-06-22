@@ -65,6 +65,24 @@ func createTablesWithAuth(db *sql.DB) error {
 			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 		)`,
 
+		`CREATE TABLE IF NOT EXISTS user_preferences (
+			user_id INTEGER PRIMARY KEY,
+			practice_session_length INTEGER NOT NULL DEFAULT 10,
+			difficulty_preference TEXT NOT NULL DEFAULT 'adaptive' CHECK (difficulty_preference IN ('easy', 'medium', 'hard', 'adaptive', 'mixed')),
+			category_preference TEXT, -- JSON array or NULL for all categories
+			review_mode TEXT NOT NULL DEFAULT 'immediate' CHECK (review_mode IN ('immediate', 'end_of_session')),
+			auto_advance_timing_open INTEGER NOT NULL DEFAULT 60000,
+			auto_advance_timing_choice INTEGER NOT NULL DEFAULT 30000,
+			question_randomization BOOLEAN NOT NULL DEFAULT 0,
+			skip_answered_questions BOOLEAN NOT NULL DEFAULT 0,
+			focus_weak_areas BOOLEAN NOT NULL DEFAULT 1,
+			theme_mode TEXT NOT NULL DEFAULT 'system' CHECK (theme_mode IN ('light', 'dark', 'system')),
+			stats_visibility BOOLEAN NOT NULL DEFAULT 1,
+			interface_language TEXT NOT NULL DEFAULT 'fr',
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+		)`,
+
 		// Updated questions table
 		`CREATE TABLE IF NOT EXISTS questions (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -113,6 +131,7 @@ func createTablesWithAuth(db *sql.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_progress_user_id ON progress(user_id)",
 		"CREATE INDEX IF NOT EXISTS idx_email_verifications_token ON email_verifications(token)",
 		"CREATE INDEX IF NOT EXISTS idx_email_verifications_user_id ON email_verifications(user_id)",
+		"CREATE INDEX IF NOT EXISTS idx_user_preferences_user_id ON user_preferences(user_id)",
 	}
 
 	for _, index := range indexes {

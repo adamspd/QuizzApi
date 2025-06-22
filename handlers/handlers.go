@@ -13,16 +13,18 @@ import (
 
 // API wrapper to hold all handlers
 type API struct {
-	authHandlers     *AuthHandlers
-	questionHandlers *QuestionHandlers
-	progressHandlers *ProgressHandlers
+	authHandlers        *AuthHandlers
+	questionHandlers    *QuestionHandlers
+	progressHandlers    *ProgressHandlers
+	preferencesHandlers *PreferencesHandlers
 }
 
 func NewAPI(database *db.DB, sessionStore *auth.SessionStore, emailService *auth.EmailService, emailConfig *models.EmailConfig) *API {
 	return &API{
-		authHandlers:     NewAuthHandlers(database, sessionStore, emailService, emailConfig),
-		questionHandlers: NewQuestionHandlers(database, sessionStore),
-		progressHandlers: NewProgressHandlers(database, sessionStore),
+		authHandlers:        NewAuthHandlers(database, sessionStore, emailService, emailConfig),
+		questionHandlers:    NewQuestionHandlers(database, sessionStore),
+		progressHandlers:    NewProgressHandlers(database, sessionStore),
+		preferencesHandlers: NewPreferencesHandlers(database, sessionStore),
 	}
 }
 
@@ -40,6 +42,9 @@ func NewRouter(database *db.DB, sessionStore *auth.SessionStore, emailConfig *mo
 
 	// Public verification endpoint (no auth required)
 	mux.HandleFunc("/verify-email", api.authHandlers.verifyEmail)
+
+	// Preferences routes with auth
+	mux.HandleFunc("/preferences", authMiddlewareWithEmailCheck(api.preferencesHandlers.HandlePreferences, sessionStore, database, emailConfig))
 
 	// Question routes with auth
 	mux.HandleFunc("/questions", authMiddlewareWithEmailCheck(api.questionHandlers.HandleQuestions, sessionStore, database, emailConfig))
