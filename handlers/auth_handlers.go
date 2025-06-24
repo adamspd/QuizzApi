@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"github.com/adamspd/QuizzApi/jobs"
 	"net/http"
 	"strings"
 
@@ -16,14 +17,16 @@ type AuthHandlers struct {
 	sessionStore *auth.SessionStore
 	emailService *auth.EmailService
 	emailConfig  *models.EmailConfig
+	jobManager   *jobs.JobManager // Assuming you have a job manager for email jobs
 }
 
-func NewAuthHandlers(database *db.DB, sessionStore *auth.SessionStore, emailService *auth.EmailService, emailConfig *models.EmailConfig) *AuthHandlers {
+func NewAuthHandlers(database *db.DB, sessionStore *auth.SessionStore, emailService *auth.EmailService, emailConfig *models.EmailConfig, jobManager *jobs.JobManager) *AuthHandlers {
 	return &AuthHandlers{
 		db:           database,
 		sessionStore: sessionStore,
 		emailService: emailService,
 		emailConfig:  emailConfig,
+		jobManager:   jobManager,
 	}
 }
 
@@ -80,12 +83,13 @@ func (ah *AuthHandlers) register(w http.ResponseWriter, r *http.Request) {
 	verification, err := ah.db.CreateEmailVerification(user.ID, user.Email)
 	if err != nil {
 		utils.LogError("Failed to create email verification: %v", err)
-		// Don't fail registration, just log the error
 	} else {
-		// Send verification email
-		if err := ah.emailService.SendVerificationEmail(user, verification.Token); err != nil {
-			utils.LogError("Failed to send verification email: %v", err)
-			// Don't fail registration, just log the error
+		// Build email content
+		subject, body := ah.emailService.BuildVerificationEmail(user, verification.Token)
+
+		// Queue verification email
+		if err := ah.jobManager.QueueVerificationEmail(user.Email, subject, body, user.ID, verification.Token); err != nil {
+			utils.LogError("Failed to queue verification email: %v", err)
 		}
 	}
 
@@ -269,10 +273,13 @@ func (ah *AuthHandlers) resendVerification(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Send verification email
-	if err := ah.emailService.SendVerificationEmail(user, verification.Token); err != nil {
-		utils.LogError("Failed to send verification email: %v", err)
-		http.Error(w, "Failed to send verification email", http.StatusInternalServerError)
+	// Build email content
+	subject, body := ah.emailService.BuildVerificationEmail(user, verification.Token)
+
+	// Queue verification email
+	if err := ah.jobManager.QueueVerificationEmail(user.Email, subject, body, user.ID, verification.Token); err != nil {
+		utils.LogError("Failed to queue verification email: %v", err)
+		http.Error(w, "Failed to queue verification email", http.StatusInternalServerError)
 		return
 	}
 

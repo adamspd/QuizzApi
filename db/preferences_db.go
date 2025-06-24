@@ -31,9 +31,9 @@ func (db *DB) GetUserPreferences(userID int) (*models.UserPreferences, error) {
 	)
 
 	if err == sql.ErrNoRows {
-		// Create default preferences for new user
-		utils.LogDB("No preferences found for user %d, creating defaults", userID)
-		return db.CreateDefaultPreferences(userID)
+		// Use atomic creation to handle race conditions
+		utils.LogDB("No preferences found for user %d, creating defaults atomically", userID)
+		return db.createDefaultPreferencesAtomic(userID)
 	}
 
 	if err != nil {
@@ -57,19 +57,20 @@ func (db *DB) GetUserPreferences(userID int) (*models.UserPreferences, error) {
 	return &prefs, nil
 }
 
-func (db *DB) CreateDefaultPreferences(userID int) (*models.UserPreferences, error) {
-	utils.LogDB("Creating default preferences for user %d", userID)
+func (db *DB) createDefaultPreferencesAtomic(userID int) (*models.UserPreferences, error) {
+	utils.LogDB("Creating default preferences atomically for user %d", userID)
 
 	defaults := models.GetDefaultPreferences(userID)
 
-	_, err := db.Exec(`
-		INSERT INTO user_preferences (
+	// Use INSERT OR IGNORE to handle concurrent creation attempts gracefully
+	result, err := db.Exec(`
+		INSERT OR IGNORE INTO user_preferences (
 			user_id, practice_session_length, difficulty_preference, category_preference,
 			review_mode, auto_advance_timing_open, auto_advance_timing_choice,
 			question_randomization, skip_answered_questions, focus_weak_areas,
 			theme_mode, stats_visibility, interface_language, updated_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-	`, userID, defaults.PracticeSessionLength, defaults.DifficultyPreference, nil, // NULL for all categories
+	`, userID, defaults.PracticeSessionLength, defaults.DifficultyPreference, nil,
 		defaults.ReviewMode, defaults.AutoAdvanceTimingOpen, defaults.AutoAdvanceTimingChoice,
 		defaults.QuestionRandomization, defaults.SkipAnsweredQuestions, defaults.FocusWeakAreas,
 		defaults.ThemeMode, defaults.StatsVisibility, defaults.InterfaceLanguage)
@@ -79,7 +80,16 @@ func (db *DB) CreateDefaultPreferences(userID int) (*models.UserPreferences, err
 		return nil, err
 	}
 
-	return defaults, nil
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		utils.LogDB("Default preferences already existed for user %d (race condition handled)", userID)
+	} else {
+		utils.LogDB("Successfully created default preferences for user %d", userID)
+	}
+
+	// Now fetch what was actually inserted (handles race condition case)
+	// Recursive call is safe here since we know the record exists now
+	return db.GetUserPreferences(userID)
 }
 
 func (db *DB) UpdateUserPreferences(userID int, req models.UserPreferencesRequest) (*models.UserPreferences, error) {
