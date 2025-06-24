@@ -1,4 +1,20 @@
 services:
+  # Redis for job queue
+  redis:
+    image: redis:7-alpine
+    container_name: french_citizenship_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    networks:
+      - citizenship-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
   # Go API backend
   api:
     build:
@@ -6,6 +22,7 @@ services:
       dockerfile: Dockerfile
     container_name: french_citizenship_api
     restart: unless-stopped
+    user: "${UID:-1000}:${GID:-1000}"  # Run as host user to avoid permission issues
     ports:
       - "8043:8043"
     env_file:
@@ -16,11 +33,15 @@ services:
       - DB_PATH=/app/data/citizenship.db
       - BASE_URL=https://citoyennete.thenightcoders.tech
       - EMAIL_GRACE_PERIOD_HOURS=2
+      - REDIS_URL=redis:6379
     volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
+      - ./data:/app/data        # Bind mount for easy access
+      - ./logs:/app/logs        # Bind mount for easy access
     networks:
       - citizenship-network
+    depends_on:
+      redis:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8043/health"]
       interval: 30s
@@ -34,5 +55,4 @@ networks:
     driver: bridge
 
 volumes:
-  data:
-  logs:
+  redis_data:  # Keep Redis as named volume since you don't need to access it directly

@@ -77,8 +77,10 @@ func (db *DB) GetUserStats(userID int) (*models.Stats, error) {
 		return nil, err
 	}
 
+	// Use COALESCE to handle NULL values when a user has no progress
 	err = db.QueryRow(`
-        SELECT COUNT(*) as answered, SUM(CASE WHEN is_correct THEN 1 ELSE 0 END) as correct
+        SELECT COALESCE(COUNT(*), 0) as answered, 
+               COALESCE(SUM(CASE WHEN is_correct THEN 1 ELSE 0 END), 0) as correct
         FROM progress WHERE user_id = ?
     `, userID).Scan(&stats.Answered, &stats.Correct)
 	if err != nil {
@@ -92,10 +94,11 @@ func (db *DB) GetUserStats(userID int) (*models.Stats, error) {
 
 	stats.Streak = db.getCurrentStreak(userID)
 
+	// Use COALESCE here too for consistency
 	rows, err := db.Query(`
         SELECT q.category, 
-               COUNT(*) as answered,
-               SUM(CASE WHEN p.is_correct THEN 1 ELSE 0 END) as correct
+               COALESCE(COUNT(*), 0) as answered,
+               COALESCE(SUM(CASE WHEN p.is_correct THEN 1 ELSE 0 END), 0) as correct
         FROM progress p
         JOIN questions q ON p.question_id = q.id
         WHERE p.user_id = ?

@@ -13,6 +13,7 @@ import (
 	"github.com/adamspd/QuizzApi/auth"
 	"github.com/adamspd/QuizzApi/db"
 	"github.com/adamspd/QuizzApi/handlers"
+	"github.com/adamspd/QuizzApi/jobs"
 	"github.com/adamspd/QuizzApi/models"
 	"github.com/adamspd/QuizzApi/utils"
 )
@@ -42,7 +43,7 @@ func main() {
 		utils.LogStartup("SMTP not configured - emails will be logged to console")
 	}
 
-	// Initialize database
+	// Initialize database FIRST
 	utils.LogStartup("Initializing database connection...")
 	database, err := db.InitDB(dbPath)
 	if err != nil {
@@ -59,13 +60,35 @@ func main() {
 		utils.LogError("Failed to create default admin user: %v", err)
 	}
 
-	// Set up graceful shutdown
+	// Initialize job manager
+	redisURL := utils.GetEnvOrDefault("REDIS_URL", "redis://localhost:6379")
+	jobManager := jobs.NewJobManager(redisURL)
+
+	// Create email service and register handlers BEFORE starting worker
+	emailService := auth.NewEmailService(emailConfig)
+	jobManager.RegisterHandlers(emailService)
+
+	// NOW start the job worker
+	go func() {
+		utils.LogStartup("Starting job queue worker...")
+		if err := jobManager.Start(); err != nil {
+			utils.LogError("Job manager failed: %v", err)
+		}
+	}()
+
+	// Set up a graceful shutdown
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
 		<-c
-		utils.LogShutdown("Received shutdown signal, closing database...")
+		utils.LogShutdown("Received shutdown signal...")
+
+		// Stop job manager first
+		jobManager.Stop()
+
+		// Then close database
+		utils.LogShutdown("Closing database...")
 		if err := database.Close(); err != nil {
 			utils.LogError("Error closing database: %v", err)
 		} else {
@@ -76,7 +99,7 @@ func main() {
 
 	// Setup API routes
 	utils.LogStartup("Setting up API routes...")
-	router := handlers.NewRouter(database, sessionStore, emailConfig)
+	router := handlers.NewRouter(database, sessionStore, emailConfig, jobManager, emailService)
 
 	// Create server with timeouts
 	server := &http.Server{
@@ -149,7 +172,6 @@ func createDefaultAdminUser(database *db.DB) error {
 	utils.LogStartup("Default admin user created:")
 	utils.LogStartup("  Username: %s", admin.Username)
 	utils.LogStartup("  Email: %s", admin.Email)
-	utils.LogStartup("  Password: %s", adminPassword)
 
 	return nil
 }

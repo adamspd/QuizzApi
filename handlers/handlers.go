@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"github.com/adamspd/QuizzApi/jobs"
 	"net/http"
 	"strconv"
 	"strings"
@@ -17,20 +18,22 @@ type API struct {
 	questionHandlers    *QuestionHandlers
 	progressHandlers    *ProgressHandlers
 	preferencesHandlers *PreferencesHandlers
+	jobManager          *jobs.JobManager
 }
 
-func NewAPI(database *db.DB, sessionStore *auth.SessionStore, emailService *auth.EmailService, emailConfig *models.EmailConfig) *API {
+func NewAPI(database *db.DB, sessionStore *auth.SessionStore, emailService *auth.EmailService, emailConfig *models.EmailConfig, jobManager *jobs.JobManager) *API {
 	return &API{
-		authHandlers:        NewAuthHandlers(database, sessionStore, emailService, emailConfig),
+		authHandlers:        NewAuthHandlers(database, sessionStore, emailService, emailConfig, jobManager),
 		questionHandlers:    NewQuestionHandlers(database, sessionStore),
 		progressHandlers:    NewProgressHandlers(database, sessionStore),
 		preferencesHandlers: NewPreferencesHandlers(database, sessionStore),
+		jobManager:          jobManager,
 	}
 }
 
-func NewRouter(database *db.DB, sessionStore *auth.SessionStore, emailConfig *models.EmailConfig) http.Handler {
-	emailService := auth.NewEmailService(emailConfig)
-	api := NewAPI(database, sessionStore, emailService, emailConfig)
+func NewRouter(database *db.DB, sessionStore *auth.SessionStore, emailConfig *models.EmailConfig, jobManager *jobs.JobManager, emailService *auth.EmailService) http.Handler {
+	// Now we pass the emailService that was created and registered in main.go
+	api := NewAPI(database, sessionStore, emailService, emailConfig, jobManager)
 
 	mux := http.NewServeMux()
 
