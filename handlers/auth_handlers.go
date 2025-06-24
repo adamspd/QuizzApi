@@ -194,47 +194,23 @@ func (ah *AuthHandlers) getCurrentUserInfo(w http.ResponseWriter, r *http.Reques
 }
 
 func (ah *AuthHandlers) verifyEmail(w http.ResponseWriter, r *http.Request) {
-	utils.LogHTTP("GET /auth/verify-email")
+	utils.LogHTTP("GET /verify-email")
 
 	token := r.URL.Query().Get("token")
 	if token == "" {
-		http.Error(w, "Verification token is required", http.StatusBadRequest)
+		http.ServeFile(w, r, "static/verify-error.html")
 		return
 	}
 
 	user, err := ah.db.VerifyEmailToken(token)
 	if err != nil {
 		utils.LogHTTP("Email verification failed: %v", err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.ServeFile(w, r, "static/verify-error.html")
 		return
 	}
 
 	utils.LogHTTP("Email verified successfully for user: %s (ID: %d)", user.Username, user.ID)
-
-	// Return HTML response for web browsers
-	w.Header().Set("Content-Type", "text/html")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Email Verified</title>
-    <style>
-        body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
-        .success { color: #28a745; }
-        .container { max-width: 500px; margin: 0 auto; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1 class="success">✓ Email Verified!</h1>
-        <p>Your email address has been successfully verified.</p>
-        <p>You can now use the French Citizenship Training app without restrictions.</p>
-        <p><a href="/">Return to App</a></p>
-    </div>
-</body>
-</html>
-	`))
+	http.ServeFile(w, r, "static/verify-email.html")
 }
 
 func (ah *AuthHandlers) resendVerification(w http.ResponseWriter, r *http.Request) {
@@ -265,7 +241,7 @@ func (ah *AuthHandlers) resendVerification(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Create new verification token
+	// Create a new verification token
 	verification, err := ah.db.CreateEmailVerification(user.ID, user.Email)
 	if err != nil {
 		utils.LogError("Failed to create email verification: %v", err)
