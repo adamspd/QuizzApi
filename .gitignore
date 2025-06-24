@@ -3,3 +3,5 @@ QuizzApi
 citizenship.db
 .env
 .DS_Store
+Dockerfile
+docker-compose.yml
