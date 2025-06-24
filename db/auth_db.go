@@ -260,6 +260,61 @@ func (db *DB) DeleteUser(id int) error {
 	return nil
 }
 
+func (db *DB) DeleteUserPermanently(id int) error {
+	utils.LogDB("Permanently deleting user ID %d", id)
+	start := time.Now()
+
+	// Start a transaction to delete user and related data
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Delete related data first (foreign key constraints)
+	// Delete user preferences
+	_, err = tx.Exec("DELETE FROM user_preferences WHERE user_id = ?", id)
+	if err != nil {
+		utils.LogError("Failed to delete user preferences for user %d: %v", id, err)
+		return err
+	}
+
+	// Delete progress records
+	_, err = tx.Exec("DELETE FROM progress WHERE user_id = ?", id)
+	if err != nil {
+		utils.LogError("Failed to delete progress records for user %d: %v", id, err)
+		return err
+	}
+
+	// Delete email verifications
+	_, err = tx.Exec("DELETE FROM email_verifications WHERE user_id = ?", id)
+	if err != nil {
+		utils.LogError("Failed to delete email verifications for user %d: %v", id, err)
+		return err
+	}
+
+	// Finally delete the user
+	result, err := tx.Exec("DELETE FROM users WHERE id = ?", id)
+	if err != nil {
+		utils.LogError("Failed to permanently delete user %d: %v", id, err)
+		return err
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return fmt.Errorf("user not found")
+	}
+
+	if err = tx.Commit(); err != nil {
+		utils.LogError("Failed to commit user deletion transaction: %v", err)
+		return err
+	}
+
+	duration := time.Since(start)
+	utils.LogDB("User %d permanently deleted in %v", id, duration)
+	return nil
+}
+
 func (db *DB) GetAllUsers() ([]models.User, error) {
 	utils.LogDB("Getting all users")
 	start := time.Now()
