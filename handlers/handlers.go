@@ -60,9 +60,9 @@ func NewRouter(database *db.DB, sessionStore *auth.SessionStore, emailConfig *mo
 			if len(parts) == 2 && parts[1] == "approve" {
 				if id, err := strconv.Atoi(parts[0]); err == nil {
 					// Require moderator or admin role for approval
-					requireRole("moderator", "admin")(authMiddlewareWithEmailCheck(func(w http.ResponseWriter, r *http.Request) {
+					authMiddlewareWithRoleCheck([]string{"moderator", "admin"}, sessionStore, database, emailConfig)(func(w http.ResponseWriter, r *http.Request) {
 						api.questionHandlers.HandleQuestionApproval(w, r, id)
-					}, sessionStore, database, emailConfig))(w, r)
+					})(w, r)
 					return
 				}
 			}
@@ -90,8 +90,8 @@ func NewRouter(database *db.DB, sessionStore *auth.SessionStore, emailConfig *mo
 	// Import/Export routes (require auth)
 	mux.HandleFunc("/import", authMiddlewareWithEmailCheck(api.questionHandlers.ImportQuestions, sessionStore, database, emailConfig))
 
-	// User management routes (admin only)
-	mux.HandleFunc("/users", requireRole("admin")(authMiddlewareWithEmailCheck(api.authHandlers.HandleUsers, sessionStore, database, emailConfig)))
+	// User management routes (admin and moderator)
+	mux.HandleFunc("/users", authMiddlewareWithRoleCheck([]string{"admin", "moderator"}, sessionStore, database, emailConfig)(api.authHandlers.HandleUsers))
 	mux.HandleFunc("/users/", func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/users/")
 		id, err := strconv.Atoi(path)
@@ -100,9 +100,9 @@ func NewRouter(database *db.DB, sessionStore *auth.SessionStore, emailConfig *mo
 			http.Error(w, "Invalid user ID", http.StatusBadRequest)
 			return
 		}
-		requireRole("admin")(authMiddlewareWithEmailCheck(func(w http.ResponseWriter, r *http.Request) {
+		authMiddlewareWithRoleCheck([]string{"admin", "moderator"}, sessionStore, database, emailConfig)(func(w http.ResponseWriter, r *http.Request) {
 			api.authHandlers.HandleUserByID(w, r, id)
-		}, sessionStore, database, emailConfig))(w, r)
+		})(w, r)
 	})
 
 	return corsMiddleware(mux)
