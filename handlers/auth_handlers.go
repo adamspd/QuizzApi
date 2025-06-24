@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"github.com/adamspd/QuizzApi/jobs"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/adamspd/QuizzApi/auth"
@@ -46,6 +47,12 @@ func (ah *AuthHandlers) HandleAuth(w http.ResponseWriter, r *http.Request) {
 		ah.verifyEmail(w, r)
 	case path == "resend-verification" && r.Method == http.MethodPost:
 		ah.resendVerification(w, r)
+	case strings.HasPrefix(path, "resend-verification/") && r.Method == http.MethodPost:
+		ah.resendVerificationForUser(w, r)
+	case strings.HasPrefix(path, "force-password-change/") && r.Method == http.MethodPost:
+		ah.forcePasswordChange(w, r)
+	case path == "delete-self" && r.Method == http.MethodPost:
+		ah.deleteSelf(w, r)
 	default:
 		http.Error(w, "Not found", http.StatusNotFound)
 	}
@@ -150,6 +157,81 @@ func (ah *AuthHandlers) logout(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"message": "Logout successful",
+	})
+}
+
+func (ah *AuthHandlers) forcePasswordChange(w http.ResponseWriter, r *http.Request) {
+	session := getSessionFromRequest(r, ah.sessionStore)
+	if session == nil {
+		http.Error(w, "Authentication required", http.StatusUnauthorized)
+		return
+	}
+
+	// Only admin and moderator can force password changes
+	if session.Role != "admin" && session.Role != "moderator" {
+		http.Error(w, "Insufficient permissions", http.StatusForbidden)
+		return
+	}
+
+	// Extract user ID from path
+	path := strings.TrimPrefix(r.URL.Path, "/auth/force-password-change/")
+	userID, err := strconv.Atoi(path)
+	if err != nil {
+		http.Error(w, "Invalid user ID", http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		NewPassword string `json:"new_password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if req.NewPassword == "" {
+		http.Error(w, "New password is required", http.StatusBadRequest)
+		return
+	}
+
+	user, err := ah.db.GetUserByID(userID)
+	if err != nil {
+		http.Error(w, "User not found", http.StatusNotFound)
+		return
+	}
+
+	// Moderators cannot change admin passwords
+	if session.Role == "moderator" && user.Role == "admin" {
+		http.Error(w, "Insufficient permissions", http.StatusForbidden)
+		return
+	}
+
+	// Admin cannot change their own password this way (security measure)
+	if session.UserID == userID {
+		http.Error(w, "Cannot force change your own password", http.StatusBadRequest)
+		return
+	}
+
+	// Update the password
+	userReq := models.UserRequest{
+		Password: req.NewPassword,
+	}
+
+	_, err = ah.db.UpdateUser(userID, userReq)
+	if err != nil {
+		utils.LogError("Failed to update user password: %v", err)
+		http.Error(w, "Failed to update password", http.StatusInternalServerError)
+		return
+	}
+
+	// Kill all sessions for this user (force re-login)
+	ah.sessionStore.DeleteUserSessions(userID)
+
+	utils.LogHTTP("Password changed for user %s (ID: %d) by %s", user.Username, user.ID, session.Username)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"message": "Password changed successfully. User will need to log in again.",
 	})
 }
 
@@ -267,6 +349,71 @@ func (ah *AuthHandlers) resendVerification(w http.ResponseWriter, r *http.Reques
 	})
 }
 
+func (ah *AuthHandlers) resendVerificationForUser(w http.ResponseWriter, r *http.Request) {
+	session := getSessionFromRequest(r, ah.sessionStore)
+	if session == nil {
+		http.Error(w, "Authentication required", http.StatusUnauthorized)
+		return
+	}
+
+	// Only admin and moderator can resend verification for others
+	if session.Role != "admin" && session.Role != "moderator" {
+		http.Error(w, "Insufficient permissions", http.StatusForbidden)
+		return
+	}
+
+	// Extract user ID from path
+	path := strings.TrimPrefix(r.URL.Path, "/auth/resend-verification/")
+	userID, err := strconv.Atoi(path)
+	if err != nil {
+		http.Error(w, "Invalid user ID", http.StatusBadRequest)
+		return
+	}
+
+	user, err := ah.db.GetUserByID(userID)
+	if err != nil {
+		utils.LogError("Failed to get user for verification resend: %v", err)
+		http.Error(w, "User not found", http.StatusNotFound)
+		return
+	}
+
+	// Moderators cannot resend verification for admin users
+	if session.Role == "moderator" && user.Role == "admin" {
+		http.Error(w, "Insufficient permissions", http.StatusForbidden)
+		return
+	}
+
+	if user.EmailVerified {
+		http.Error(w, "Email already verified", http.StatusBadRequest)
+		return
+	}
+
+	// Create a new verification token
+	verification, err := ah.db.CreateEmailVerification(user.ID, user.Email)
+	if err != nil {
+		utils.LogError("Failed to create email verification: %v", err)
+		http.Error(w, "Failed to create verification token", http.StatusInternalServerError)
+		return
+	}
+
+	// Build email content
+	subject, body := ah.emailService.BuildVerificationEmail(user, verification.Token)
+
+	// Queue verification email
+	if err := ah.jobManager.QueueVerificationEmail(user.Email, subject, body, user.ID, verification.Token); err != nil {
+		utils.LogError("Failed to queue verification email: %v", err)
+		http.Error(w, "Failed to queue verification email", http.StatusInternalServerError)
+		return
+	}
+
+	utils.LogHTTP("Verification email resent for user %s (ID: %d) by %s", user.Username, user.ID, session.Username)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"message": "Verification email sent successfully",
+	})
+}
+
 func (ah *AuthHandlers) HandleUsers(w http.ResponseWriter, r *http.Request) {
 	utils.LogHTTP("%s /users", r.Method)
 	switch r.Method {
@@ -296,6 +443,12 @@ func (ah *AuthHandlers) HandleUserByID(w http.ResponseWriter, r *http.Request, i
 }
 
 func (ah *AuthHandlers) getUsers(w http.ResponseWriter, r *http.Request) {
+	session := getSessionFromRequest(r, ah.sessionStore)
+	if session == nil {
+		http.Error(w, "Authentication required", http.StatusUnauthorized)
+		return
+	}
+
 	users, err := ah.db.GetAllUsers()
 	if err != nil {
 		utils.LogError("Failed to fetch users: %v", err)
@@ -303,7 +456,18 @@ func (ah *AuthHandlers) getUsers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	utils.LogHTTP("Returning %d users", len(users))
+	// If moderator, filter out admin users
+	if session.Role == "moderator" {
+		var filteredUsers []models.User
+		for _, user := range users {
+			if user.Role != "admin" {
+				filteredUsers = append(filteredUsers, user)
+			}
+		}
+		users = filteredUsers
+	}
+
+	utils.LogHTTP("Returning %d users to %s", len(users), session.Role)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"users": users,
@@ -317,12 +481,6 @@ func (ah *AuthHandlers) getUserByID(w http.ResponseWriter, r *http.Request, id i
 		return
 	}
 
-	// Users can only see their own info unless they're admin
-	if session.UserID != id && session.Role != "admin" {
-		http.Error(w, "Insufficient permissions", http.StatusForbidden)
-		return
-	}
-
 	user, err := ah.db.GetUserByID(id)
 	if err != nil {
 		utils.LogHTTP("User ID %d not found: %v", id, err)
@@ -330,7 +488,20 @@ func (ah *AuthHandlers) getUserByID(w http.ResponseWriter, r *http.Request, id i
 		return
 	}
 
-	utils.LogHTTP("Returning user ID %d", id)
+	// Check permissions
+	if session.UserID == id {
+		// Users can always see their own info
+	} else if session.Role == "admin" {
+		// Admins can see anyone
+	} else if session.Role == "moderator" && user.Role != "admin" {
+		// Moderators can see non-admin users
+	} else {
+		// All other cases are forbidden
+		http.Error(w, "Insufficient permissions", http.StatusForbidden)
+		return
+	}
+
+	utils.LogHTTP("Returning user ID %d to %s", id, session.Username)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(user)
 }
@@ -367,12 +538,45 @@ func (ah *AuthHandlers) createUserByAdmin(w http.ResponseWriter, r *http.Request
 }
 
 func (ah *AuthHandlers) updateUserByAdmin(w http.ResponseWriter, r *http.Request, id int) {
+	session := getSessionFromRequest(r, ah.sessionStore)
+	if session == nil {
+		http.Error(w, "Authentication required", http.StatusUnauthorized)
+		return
+	}
+
+	// Get the user being edited
+	targetUser, err := ah.db.GetUserByID(id)
+	if err != nil {
+		http.Error(w, "User not found", http.StatusNotFound)
+		return
+	}
+
 	var req models.UserRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		utils.LogHTTP("Invalid JSON in update user request for ID %d: %v", id, err)
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
+
+	// Non-admins cannot change role or active status
+	if session.Role != "admin" {
+		if req.Role != "" && req.Role != targetUser.Role {
+			http.Error(w, "Insufficient permissions to change user role", http.StatusForbidden)
+			return
+		}
+		if req.IsActive != nil && *req.IsActive != targetUser.IsActive {
+			http.Error(w, "Insufficient permissions to change user active status", http.StatusForbidden)
+			return
+		}
+	}
+
+	// Moderators cannot edit admin users (except themselves for basic info)
+	if session.Role == "moderator" && targetUser.Role == "admin" && session.UserID != id {
+		http.Error(w, "Moderators cannot edit admin users", http.StatusForbidden)
+		return
+	}
+
+	utils.LogHTTP("Updating user with request: %+v", req)
 
 	user, err := ah.db.UpdateUser(id, req)
 	if err != nil {
@@ -385,13 +589,13 @@ func (ah *AuthHandlers) updateUserByAdmin(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// If user was deactivated, kill their sessions
-	if req.IsActive != nil && !*req.IsActive {
+	// If user was deactivated by admin, kill their sessions
+	if req.IsActive != nil && !*req.IsActive && session.UserID != id {
 		ah.sessionStore.DeleteUserSessions(id)
 		utils.LogHTTP("Deleted sessions for deactivated user ID %d", id)
 	}
 
-	utils.LogHTTP("Updated user ID %d by admin", id)
+	utils.LogHTTP("Updated user ID %d by %s", id, session.Username)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(user)
 }
@@ -403,22 +607,105 @@ func (ah *AuthHandlers) deleteUserByAdmin(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	err := ah.db.DeleteUser(id)
+	// Check if the user exists and get their info
+	user, err := ah.db.GetUserByID(id)
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
-			http.Error(w, "User not found", http.StatusNotFound)
-		} else {
-			utils.LogError("Failed to delete user ID %d: %v", id, err)
-			http.Error(w, "Failed to delete user", http.StatusInternalServerError)
-		}
+		http.Error(w, "User not found", http.StatusNotFound)
 		return
 	}
 
-	// Kill user's sessions
+	// Moderators cannot delete admin users
+	if session.Role == "moderator" && user.Role == "admin" {
+		http.Error(w, "Insufficient permissions", http.StatusForbidden)
+		return
+	}
+
+	// Only admins can permanently delete users
+	if session.Role != "admin" {
+		// Moderators can only deactivate
+		err := ah.db.DeleteUser(id) // This just deactivates
+		if err != nil {
+			utils.LogError("Failed to deactivate user ID %d: %v", id, err)
+			http.Error(w, "Failed to deactivate user", http.StatusInternalServerError)
+			return
+		}
+
+		// Kill user's sessions
+		ah.sessionStore.DeleteUserSessions(id)
+
+		utils.LogHTTP("User ID %d deactivated by moderator %s", id, session.Username)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	// For admins, check if they want permanent deletion or just deactivation
+	permanent := r.URL.Query().Get("permanent")
+
+	if permanent == "true" {
+		// Permanent deletion
+		err := ah.db.DeleteUserPermanently(id)
+		if err != nil {
+			utils.LogError("Failed to permanently delete user ID %d: %v", id, err)
+			http.Error(w, "Failed to permanently delete user", http.StatusInternalServerError)
+			return
+		}
+		utils.LogHTTP("User ID %d permanently deleted by admin %s", id, session.Username)
+	} else {
+		// Just deactivate
+		err := ah.db.DeleteUser(id)
+		if err != nil {
+			utils.LogError("Failed to deactivate user ID %d: %v", id, err)
+			http.Error(w, "Failed to deactivate user", http.StatusInternalServerError)
+			return
+		}
+		utils.LogHTTP("User ID %d deactivated by admin %s", id, session.Username)
+	}
+
+	// Kill user's sessions in both cases
 	ah.sessionStore.DeleteUserSessions(id)
 
-	utils.LogHTTP("Deleted user ID %d by admin", id)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (ah *AuthHandlers) deleteSelf(w http.ResponseWriter, r *http.Request) {
+	session := getSessionFromRequest(r, ah.sessionStore)
+	if session == nil {
+		http.Error(w, "Authentication required", http.StatusUnauthorized)
+		return
+	}
+
+	var req struct {
+		Permanent bool `json:"permanent"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		// If no "body" or invalid JSON, default to deactivation
+		req.Permanent = false
+	}
+
+	// TODO: Add immediate permanent deletion for users when questions/author relationship is handled
+	// For now, both deactivation and permanent deletion requests result in deactivation
+	// to preserve data integrity with questions table
+
+	err := ah.db.DeleteUser(session.UserID) // This just deactivates
+	if err != nil {
+		utils.LogError("Failed to deactivate user ID %d (self-deletion): %v", session.UserID, err)
+		http.Error(w, "Failed to deactivate account", http.StatusInternalServerError)
+		return
+	}
+
+	// Kill all sessions for this user
+	ah.sessionStore.DeleteUserSessions(session.UserID)
+
+	if req.Permanent {
+		utils.LogHTTP("User ID %d requested permanent self-deletion (deactivated for now)", session.UserID)
+	} else {
+		utils.LogHTTP("User ID %d requested self-deactivation", session.UserID)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"message": "Account deactivated successfully",
+	})
 }
 
 func getSessionFromRequest(r *http.Request, sessionStore *auth.SessionStore) *models.Session {
