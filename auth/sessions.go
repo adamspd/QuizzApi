@@ -43,8 +43,8 @@ func (s *SessionStore) CreateSession(user *models.User) *models.Session {
 }
 
 func (s *SessionStore) GetSession(sessionID string) (*models.Session, bool) {
-	s.mutex.RLock()
-	defer s.mutex.RUnlock()
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
 
 	session, exists := s.sessions[sessionID]
 	if !exists {
@@ -56,6 +56,10 @@ func (s *SessionStore) GetSession(sessionID string) (*models.Session, bool) {
 		delete(s.sessions, sessionID)
 		return nil, false
 	}
+
+	// Extend the session expiry on each access (auto-renewal)
+	session.ExpiresAt = time.Now().Add(72 * time.Hour)
+	utils.LogInfo("Session %s extended until %v", sessionID[:8]+"...", session.ExpiresAt.Format("2006-01-02 15:04:05"))
 
 	return session, true
 }
