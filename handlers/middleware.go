@@ -115,6 +115,66 @@ func optionalAuthMiddleware(sessionStore *auth.SessionStore) func(http.HandlerFu
 	}
 }
 
+func authMiddlewareWithRoleCheck(requiredRoles []string, sessionStore *auth.SessionStore, database *db.DB, emailConfig *models.EmailConfig) func(http.HandlerFunc) http.HandlerFunc {
+	return func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			sessionID := extractSessionFromRequest(r)
+			if sessionID == "" {
+				http.Error(w, "Missing session token", http.StatusUnauthorized)
+				return
+			}
+
+			session, exists := sessionStore.GetSession(sessionID)
+			if !exists {
+				http.Error(w, "Invalid or expired session", http.StatusUnauthorized)
+				return
+			}
+
+			// Check role requirements
+			if len(requiredRoles) > 0 {
+				hasRole := false
+				for _, role := range requiredRoles {
+					if session.Role == role {
+						hasRole = true
+						break
+					}
+				}
+				if !hasRole {
+					http.Error(w, "Insufficient permissions", http.StatusForbidden)
+					return
+				}
+			}
+
+			// Check email verification
+			user, err := database.GetUserByID(session.UserID)
+			if err != nil {
+				utils.LogError("Failed to get user for email verification check: %v", err)
+				http.Error(w, "Internal server error", http.StatusInternalServerError)
+				return
+			}
+
+			if !user.EmailVerified {
+				inGracePeriod, err := database.IsUserInGracePeriod(user.ID, emailConfig.GracePeriod)
+				if err != nil {
+					utils.LogError("Failed to check grace period: %v", err)
+					http.Error(w, "Internal server error", http.StatusInternalServerError)
+					return
+				}
+
+				if !inGracePeriod {
+					utils.LogInfo("User %s (%d) blocked - email not verified and grace period expired", user.Username, user.ID)
+					http.Error(w, "Email verification required. Please check your email and verify your account.", http.StatusForbidden)
+					return
+				}
+			}
+
+			// Add session to request context
+			ctx := context.WithValue(r.Context(), sessionContextKey, session)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		}
+	}
+}
+
 // requireRole middleware checks if user has required role
 func requireRole(roles ...string) func(http.HandlerFunc) http.HandlerFunc {
 	return func(next http.HandlerFunc) http.HandlerFunc {
